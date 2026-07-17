@@ -1,0 +1,31 @@
+# Reverse proxy. One origin for the web app, the REST API and the Yjs WebSocket.
+#
+# Local dev: listens on :8080 over plain HTTP.
+# Production: replace `:8080` with your domain (e.g. `vault.example.com`) and
+# Caddy will obtain and renew a Let's Encrypt certificate automatically.
+:8080 {
+	# REST API
+	handle /api/* {
+		reverse_proxy backend:3000
+	}
+
+	# Yjs realtime sync (WebSocket upgrade is forwarded transparently).
+	handle /ws/* {
+		reverse_proxy backend:3000
+	}
+
+	# Static web editor (SPA fallback handled inside the web container).
+	handle {
+		reverse_proxy web:80
+	}
+
+	# Don't log the `token` query param used by the Yjs provider.
+	log {
+		output stderr
+		format filter {
+			request>uri query {
+				delete token
+			}
+		}
+	}
+}

@@ -1,0 +1,27 @@
+packages:
+  - 'packages/*'
+
+# A single Yjs instance across plugin + web + backend is mandatory:
+# multiple yjs copies break CRDT sync. Pinned to an EXACT version (not a caret
+# range) so every install/image resolves the same one.
+overrides:
+  yjs: 13.6.31
+  # A single CodeMirror core across the web app and y-codemirror.next (a caret
+  # is enough here — one deduped copy, unlike yjs where two would corrupt sync).
+  '@codemirror/state': ^6.7.0
+  '@codemirror/view': ^6.34.0
+
+# pnpm 10+ blocks lifecycle build scripts by default; allow the ones we trust.
+onlyBuiltDependencies:
+  - esbuild
+  - prisma
+  - '@prisma/client'
+  - '@prisma/engines'
+  - argon2
+  - better-sqlite3
+
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true

@@ -1,0 +1,43 @@
+{
+  "name": "@oc/shared",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "commonjs",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/cjs/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./crypto": {
+      "types": "./dist/cjs/crypto.d.ts",
+      "import": "./dist/esm/crypto.js",
+      "require": "./dist/cjs/crypto.js"
+    },
+    "./yjs-provider": {
+      "types": "./dist/cjs/yjs-provider.d.ts",
+      "import": "./dist/esm/yjs-provider.js",
+      "require": "./dist/cjs/yjs-provider.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json && node scripts/esm-pkg.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.8"
+  }
+}

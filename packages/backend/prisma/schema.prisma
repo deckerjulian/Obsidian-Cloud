@@ -1,0 +1,176 @@
+// Obsidian-Cloud data model.
+// Server-authoritative vault tree + ACL; document content is a Yjs blob.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum NodeKind {
+  folder
+  file
+}
+
+enum Role {
+  owner
+  editor
+  viewer
+}
+
+enum Capability {
+  read
+  create
+  edit
+  delete
+  share
+}
+
+enum AuthSource {
+  local
+  ldap
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  displayName  String
+  authSource   AuthSource @default(local)
+  passwordHash String? // null for directory (LDAP/AD) accounts
+  externalId   String?    @unique // LDAP DN / AD objectGUID or userPrincipalName
+  isAdmin      Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+
+  acl     AclEntry[]
+  tokens  RefreshToken[]
+  userKey UserKey?
+
+  @@map("users")
+}
+
+// Rotating refresh tokens with family-based reuse detection.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  familyId  String
+  tokenHash String   @unique
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// The vault tree (folders + files). A single root node has path '' and parentId null.
+model Node {
+  id        String   @id @default(uuid())
+  parentId  String?
+  parent    Node?    @relation("NodeChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children  Node[]   @relation("NodeChildren")
+  kind      NodeKind
+  name      String // E2EE: ciphertext of the node name (opaque base64); root is ''
+  docId     String?  @unique // stable per node (files + folders); Yjs room key + content/name key id
+  isText    Boolean  @default(true)
+  mime      String?
+  path      String   @unique // materialized id-path (parent ids joined by '/'); powers ancestor ACL lookups, reveals no names
+  depth     Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Non-null for system folders (e.g. 'plugins' = the central Obsidian
+  // plugin folder). At most one node per type (unique index; NULLs are
+  // exempt in Postgres), admin-only mutation enforced in NodesService.
+  systemType String? @unique
+
+  acl          AclEntry[]
+  blob         Blob?
+  documentKeys DocumentKey[]
+  docUpdates   DocUpdate[]
+
+  @@index([parentId])
+  @@map("nodes")
+}
+
+// Explicit permission grant; inherited down the subtree at query time.
+// updatedAt feeds the cheap /tree ETag (any grant change invalidates it).
+model AclEntry {
+  id           String       @id @default(uuid())
+  nodeId       String
+  node         Node         @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role         Role // closest preset label (display)
+  capabilities Capability[] @default([]) // authoritative; empty = derive from role
+  updatedAt    DateTime     @default(now()) @updatedAt
+
+  @@unique([nodeId, userId])
+  @@index([userId])
+  @@index([nodeId])
+  @@map("acl_entries")
+}
+
+// Non-text files stored opaquely.
+model Blob {
+  docId     String   @id
+  node      Node     @relation(fields: [docId], references: [docId], onDelete: Cascade)
+  content   Bytes
+  sha256    String
+  size      Int
+  updatedAt DateTime @updatedAt
+
+  @@map("blobs")
+}
+
+// Runtime-editable key/value config (e.g. the 'auth' provider/LDAP settings).
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+// ── E2EE key material (server stores only opaque base64; never the plaintext) ──
+
+// A user's RSA key pair: public key + passphrase-wrapped private key.
+model UserKey {
+  userId              String   @id
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  publicKey           String // base64 SPKI
+  encryptedPrivateKey String // base64, AES-GCM wrapped with the E2EE passphrase
+  kdfSalt             String // base64
+  createdAt           DateTime @default(now())
+
+  @@map("user_keys")
+}
+
+// Append-only log of ENCRYPTED Yjs updates per document. The relay only ever
+// stores and forwards these opaque blobs; it cannot read document content.
+model DocUpdate {
+  id        BigInt   @id @default(autoincrement())
+  docId     String
+  node      Node     @relation(fields: [docId], references: [docId], onDelete: Cascade)
+  data      Bytes // AES-GCM encrypted Yjs update
+  createdAt DateTime @default(now())
+
+  @@index([docId, id])
+  @@map("doc_updates")
+}
+
+// A document's content key, wrapped (RSA-OAEP) for one authorised user.
+model DocumentKey {
+  docId      String
+  node       Node     @relation(fields: [docId], references: [docId], onDelete: Cascade)
+  userId     String
+  wrappedKey String // base64
+  createdAt  DateTime @default(now())
+
+  @@id([docId, userId])
+  @@index([userId])
+  @@map("document_keys")
+}

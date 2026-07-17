@@ -1,0 +1,25 @@
+{
+  "name": "obsidian-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "description": "Multi-user Obsidian vault with per-folder/document permissions, real-time collaborative sync and a web editor.",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test",
+    "lint": "pnpm -r --if-present lint",
+    "dev:backend": "pnpm --filter @oc/shared build && pnpm --filter @oc/backend start:dev",
+    "dev:web": "pnpm --filter @oc/shared build && pnpm --filter @oc/web dev",
+    "dev:plugin": "pnpm --filter @oc/shared build && pnpm --filter @oc/plugin dev",
+    "prisma:migrate": "pnpm --filter @oc/backend prisma:migrate",
+    "prisma:generate": "pnpm --filter @oc/backend prisma:generate"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

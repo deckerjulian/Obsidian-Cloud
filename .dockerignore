@@ -1,0 +1,28 @@
+# Never copy host-installed dependencies or build outputs into the image:
+# they are platform-specific (macOS/arm64) and make pnpm abort in the container.
+**/node_modules
+node_modules
+**/dist
+dist
+**/.pnpm-store
+.pnpm-store
+
+# VCS / local-only
+.git
+.gitignore
+
+# Build artifacts
+**/*.tsbuildinfo
+**/coverage
+packages/plugin/main.js
+packages/plugin/styles.css
+
+# Secrets / local env (provided via docker-compose environment instead)
+.env
+.env.*
+!.env.example
+
+# OS / editor
+**/.DS_Store
+.idea
+.vscode

@@ -1,0 +1,57 @@
+# ── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+
+# ── Build output ──────────────────────────────────────────────────────────────
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Web (Vite)
+packages/web/dist/
+
+# Obsidian plugin bundle (built from source via `pnpm --filter @oc/plugin build`)
+packages/plugin/main.js
+packages/plugin/styles.css
+
+# Prisma generated client + local dev databases
+# NOTE: prisma/migrations/ IS tracked — it's the schema history, do not ignore it.
+packages/backend/prisma/generated/
+packages/backend/prisma/*.db
+packages/backend/prisma/migrations/dev.db*
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Tests / coverage ──────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+
+# ── Caches ────────────────────────────────────────────────────────────────────
+.cache/
+.vite/
+.eslintcache
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editors / tooling ─────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+
+# ── Miscellaneous ─────────────────────────────────────────────────────────────
+.claude/

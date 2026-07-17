@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-cloud",
+  "name": "Obsidian Cloud",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Multi-user vault sync with per-folder/document permissions and real-time collaborative editing against a self-hosted backend.",
+  "author": "Obsidian-Cloud",
+  "isDesktopOnly": false
+}
