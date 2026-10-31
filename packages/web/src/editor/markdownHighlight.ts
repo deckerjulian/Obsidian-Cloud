@@ -1,24 +1,66 @@
-import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { HighlightStyle, syntaxHighlighting, syntaxTree } from '@codemirror/language';
+import { RangeSetBuilder } from '@codemirror/state';
+import { Decoration, ViewPlugin, type DecorationSet, type EditorView, type ViewUpdate } from '@codemirror/view';
 import { tags as t } from '@lezer/highlight';
+import { obsidianTags } from './obsidianSyntax';
 
-/** A dark Markdown highlight style: headings get larger/bolder, like Obsidian. */
+/** Markdown highlight style (colours from the Obsidian CSS variables, light/dark). */
 const style = HighlightStyle.define([
-  { tag: t.heading1, fontSize: '1.65em', fontWeight: '700', color: '#ededf0', lineHeight: '1.3' },
-  { tag: t.heading2, fontSize: '1.4em', fontWeight: '700', color: '#e6e6ea' },
-  { tag: t.heading3, fontSize: '1.2em', fontWeight: '600', color: '#e0e0e6' },
-  { tag: [t.heading4, t.heading5, t.heading6], fontSize: '1.05em', fontWeight: '600', color: '#d6d6dc' },
+  // Heading sizes come from the line classes below (like Obsidian's HyperMD-header-N).
+  { tag: t.heading1, color: 'var(--h1-color, var(--text-normal))' },
+  { tag: t.heading2, color: 'var(--h2-color, var(--text-normal))' },
+  { tag: t.heading3, color: 'var(--h3-color, var(--text-normal))' },
+  { tag: [t.heading4, t.heading5, t.heading6], color: 'var(--text-normal)' },
   { tag: t.heading, fontWeight: '700' },
-  { tag: t.strong, fontWeight: '700', color: '#ffffff' },
-  { tag: t.emphasis, fontStyle: 'italic', color: '#dcdce2' },
-  { tag: t.strikethrough, textDecoration: 'line-through', color: '#8a8a92' },
-  { tag: t.link, color: '#a78bfa', textDecoration: 'underline' },
-  { tag: t.url, color: '#7aa2f7' },
-  { tag: t.monospace, color: '#9ece6a', fontFamily: 'var(--oc-font-mono)' },
-  { tag: t.quote, color: '#9a9aa2', fontStyle: 'italic' },
-  { tag: t.list, color: '#a78bfa' },
-  { tag: t.contentSeparator, color: '#6b6b73' },
+  { tag: t.strong, fontWeight: '700' },
+  { tag: t.emphasis, fontStyle: 'italic' },
+  { tag: t.strikethrough, textDecoration: 'line-through', color: 'var(--text-muted)' },
+  { tag: t.link, color: 'var(--text-accent)', textDecoration: 'underline' },
+  { tag: t.url, color: 'var(--text-accent)' },
+  { tag: t.monospace, color: 'var(--code-normal, var(--text-normal))', fontFamily: 'var(--font-monospace)' },
+  { tag: t.quote, color: 'var(--text-muted)' },
+  { tag: t.list, color: 'var(--list-marker-color, var(--text-accent))' },
+  { tag: t.contentSeparator, color: 'var(--text-faint)' },
+  { tag: t.comment, color: 'var(--text-faint)' },
+  { tag: obsidianTags.internalLink, color: 'var(--link-color, var(--text-accent))', textDecoration: 'underline' },
+  { tag: obsidianTags.highlight, class: 'cm-highlight' },
+  { tag: obsidianTags.hashtag, class: 'cm-hashtag' },
+  { tag: obsidianTags.math, color: 'var(--text-accent)', fontFamily: 'var(--font-monospace)' },
   // The `#`, `**`, `-` markers themselves stay faint.
-  { tag: [t.meta, t.processingInstruction], color: '#6b6b73' },
+  { tag: [t.meta, t.processingInstruction], color: 'var(--text-faint)' },
 ]);
 
-export const markdownHighlighting = syntaxHighlighting(style);
+/** Line classes for ATX headings (`HyperMD-header HyperMD-header-N`). */
+const headingLines = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+    constructor(view: EditorView) {
+      this.decorations = this.build(view);
+    }
+    update(u: ViewUpdate): void {
+      if (u.docChanged || u.viewportChanged || syntaxTree(u.startState) !== syntaxTree(u.state)) this.decorations = this.build(u.view);
+    }
+    build(view: EditorView): DecorationSet {
+      const b = new RangeSetBuilder<Decoration>();
+      for (const { from, to } of view.visibleRanges) {
+        syntaxTree(view.state).iterate({
+          from,
+          to,
+          enter: (n) => {
+            const m = /^ATXHeading(\d)$/.exec(n.name);
+            if (m) {
+              b.add(view.state.doc.lineAt(n.from).from, view.state.doc.lineAt(n.from).from, Decoration.line({ class: `HyperMD-header HyperMD-header-${m[1]}` }));
+              return false;
+            }
+            if (n.name !== 'Document' && !n.name.endsWith('List') && n.name !== 'ListItem' && n.name !== 'Blockquote') return false;
+            return;
+          },
+        });
+      }
+      return b.finish();
+    }
+  },
+  { decorations: (v) => v.decorations },
+);
+
+export const markdownHighlighting = [syntaxHighlighting(style), headingLines];

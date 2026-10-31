@@ -22,7 +22,7 @@ import {
   type UpdateNodeRequest,
 } from '@oc/shared';
 import { PrismaService } from '../prisma/prisma.service';
-import { AclService, type Principal } from '../acl/acl.service';
+import { AclService, restrictForConfig, type Principal } from '../acl/acl.service';
 
 function toTreeNodeDto(node: PrismaNode, capabilities: Capability[]): TreeNodeDto {
   return {
@@ -36,6 +36,7 @@ function toTreeNodeDto(node: PrismaNode, capabilities: Capability[]): TreeNodeDt
     mime: node.mime,
     depth: node.depth,
     systemType: (node.systemType as TreeNodeDto['systemType']) ?? null,
+    isVault: node.isVault,
     role: roleLabelForCapabilities(capabilities),
     capabilities,
     updatedAt: node.updatedAt.toISOString(),
@@ -87,7 +88,7 @@ export class NodesService {
   async getTree(user: Principal): Promise<TreeResponse> {
     const all = await this.prisma.node.findMany({ orderBy: { path: 'asc' } });
 
-    // Admins have full rights everywhere, including the central plugin folder.
+    // Admins have full rights everywhere.
     if (user.isAdmin) {
       return { nodes: all.map((n) => toTreeNodeDto(n, [...ALL_CAPABILITIES])) };
     }
@@ -97,8 +98,12 @@ export class NodesService {
       select: { role: true, capabilities: true, node: { select: { path: true, depth: true } } },
     });
 
+    // Config folders (`.obsidian`): read-only unless plugin admin.
+    const configPaths = all.filter((n) => n.systemType === 'config').map((n) => n.path);
+    const canManageConfig = configPaths.length > 0 && (await this.acl.canManageConfig(user));
+    const inConfig = (path: string): boolean => configPaths.some((p) => isAncestorOrSelf(p, path));
+
     const nodes: TreeNodeDto[] = [];
-    const included = new Set<string>();
     for (const n of all) {
       let bestDepth = -1;
       const caps = new Set<Capability>();
@@ -116,46 +121,28 @@ export class NodesService {
         }
       }
       if (caps.size > 0) {
-        nodes.push(toTreeNodeDto(n, [...caps]));
-        included.add(n.id);
-      }
-    }
-
-    // The central plugin folder is auto-distributed: every user gets read on it
-    // and its subtree (so the Obsidian plugin can download the managed plugins).
-    // The web hides it from non-admins; the plugin still receives it.
-    const pluginsRoot = all.find((n) => n.systemType === 'plugins');
-    if (pluginsRoot) {
-      const prefix = `${pluginsRoot.path}/`;
-      for (const n of all) {
-        if (included.has(n.id)) continue;
-        if (n.id === pluginsRoot.id || n.path.startsWith(prefix)) {
-          nodes.push(toTreeNodeDto(n, ['read']));
-        }
+        const effective = restrictForConfig([...caps], inConfig(n.path), canManageConfig);
+        if (effective.length > 0) nodes.push(toTreeNodeDto(n, effective));
       }
     }
     return { nodes };
   }
 
   async create(user: Principal, dto: CreateNodeRequest): Promise<TreeNodeDto> {
-    // System folders (e.g. the central plugin folder) are admin-created,
-    // top-level, and unique per type.
-    if (dto.systemType) {
-      if (!user.isAdmin) {
-        throw new ForbiddenException('Only admins can create system folders');
-      }
-      if (dto.kind !== 'folder' || dto.parentId !== null) {
-        throw new BadRequestException('A system folder must be a folder at the vault root');
-      }
-      const existing = await this.prisma.node.findFirst({
-        where: { systemType: dto.systemType },
-      });
-      if (existing) throw new ConflictException('This system folder already exists');
-    }
+    // A vault's config folder: a direct child of the vault, one per vault,
+    // created by admins / plugin admins only.
+    if (dto.systemType) await this.assertConfigFolderAllowed(user, dto.kind, dto.parentId);
 
+    // Vaults are top-level folders. Any signed-in user may create one (no
+    // 'create' grant on the shared root needed) and becomes its owner.
+    if (dto.isVault) {
+      if (dto.kind !== 'folder' || dto.parentId !== null || dto.systemType) {
+        throw new BadRequestException('A vault must be a plain folder at the root');
+      }
+    }
     const parent = await this.resolveParent(dto.parentId);
     if (parent.kind !== 'folder') throw new BadRequestException('Parent must be a folder');
-    await this.acl.requireCapability(user, parent.path, 'create');
+    if (!dto.isVault) await this.acl.requireCapability(user, parent.path, 'create');
 
     const name = validateName(dto.name); // ciphertext; .md enforcement happens client-side
     const isFile = dto.kind === 'file';
@@ -179,6 +166,19 @@ export class NodesService {
           isText,
           mime: dto.mime ?? null,
           systemType: dto.systemType ?? null,
+          isVault: dto.isVault ?? false,
+          // The creator owns a new vault; admins have access implicitly.
+          ...(dto.isVault && !user.isAdmin
+            ? {
+                acl: {
+                  create: {
+                    userId: user.userId,
+                    role: 'owner' as const,
+                    capabilities: [...ALL_CAPABILITIES],
+                  },
+                },
+              }
+            : {}),
         },
       });
       const caps = (await this.acl.effectiveCapabilities(user, path)) ?? capabilitiesForRole('editor');
@@ -191,19 +191,35 @@ export class NodesService {
   async update(user: Principal, id: string, dto: UpdateNodeRequest): Promise<TreeNodeDto> {
     const node = await this.nodeOr404(id);
     if (node.path === '') throw new BadRequestException('Cannot modify the root');
-    // System folders are shared with regular users (that's their point), but
-    // only admins may rename them — and nobody may move them off the root:
-    // clients locate them by systemType and rely on the top-level invariant.
-    if (node.systemType) {
-      if (!user.isAdmin) throw new ForbiddenException('Only admins can modify system folders');
-      if (dto.parentId !== undefined && dto.parentId !== node.parentId) {
-        throw new BadRequestException('System folders cannot be moved');
-      }
+    // Config folders stay where clients look for them (directly in the vault).
+    if (node.systemType && dto.parentId !== undefined && dto.parentId !== node.parentId) {
+      throw new BadRequestException('System folders cannot be moved');
     }
     await this.acl.requireCapability(user, node.path, 'edit');
 
+    // Flag an existing `.obsidian` folder (created before the flag existed)
+    // as the vault's config folder.
+    if (dto.systemType && dto.systemType !== node.systemType) {
+      await this.assertConfigFolderAllowed(user, node.kind, node.parentId);
+      if (dto.parentId !== undefined && dto.parentId !== node.parentId) {
+        throw new BadRequestException('System folders cannot be moved');
+      }
+      try {
+        const updated = await this.prisma.node.update({
+          where: { id: node.id },
+          data: { systemType: dto.systemType, ...(dto.name !== undefined ? { name: validateName(dto.name) } : {}) },
+        });
+        const caps = (await this.acl.effectiveCapabilities(user, node.path)) ?? capabilitiesForRole('editor');
+        return toTreeNodeDto(updated, caps);
+      } catch (err) {
+        throw this.mapWriteError(err);
+      }
+    }
+
     const name = dto.name !== undefined ? validateName(dto.name) : node.name;
     const moving = dto.parentId !== undefined && dto.parentId !== node.parentId;
+    // Vault roots stay at the top level (clients locate them there).
+    if (node.isVault && moving) throw new BadRequestException('Vaults cannot be moved');
 
     // Rename only: the id-path is stable, so just replace the (ciphertext) name.
     if (!moving) {
@@ -254,16 +270,25 @@ export class NodesService {
   async remove(user: Principal, id: string): Promise<void> {
     const node = await this.nodeOr404(id);
     if (node.path === '') throw new BadRequestException('Cannot delete the root');
-    // Deleting a system folder cascades away every member's plugin files and
-    // wrapped keys — admin-only, mirroring the create() gate.
-    if (node.systemType && !user.isAdmin) {
-      throw new ForbiddenException('Only admins can delete system folders');
-    }
+    // Inside a config folder 'delete' is reserved to admins / plugin admins
+    // (enforced by the capability check).
     await this.acl.requireCapability(user, node.path, 'delete');
     await this.prisma.node.delete({ where: { id } }); // cascades to children/acl/document/blob
   }
 
   // ── helpers ────────────────────────────────────────────────────────────────
+
+  /** A config folder is a folder directly inside a vault, set up by an admin
+   *  or plugin admin. (Uniqueness per vault: the (parentId, systemType) index.) */
+  private async assertConfigFolderAllowed(user: Principal, kind: string, parentId: string | null): Promise<void> {
+    if (!(await this.acl.canManageConfig(user))) {
+      throw new ForbiddenException('Only admins and plugin admins can manage a vault config folder');
+    }
+    const parent = parentId ? await this.prisma.node.findUnique({ where: { id: parentId } }) : null;
+    if (kind !== 'folder' || !parent?.isVault) {
+      throw new BadRequestException('A config folder must be a folder directly inside a vault');
+    }
+  }
 
   private async resolveParent(parentId: string | null): Promise<PrismaNode> {
     if (parentId === null) return this.ensureRoot();
@@ -278,7 +303,7 @@ export class NodesService {
 
   private mapWriteError(err: unknown): Error {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      return new ConflictException('A node with that name already exists here');
+      return new ConflictException('A node with that name (or a config folder) already exists here');
     }
     return err as Error;
   }

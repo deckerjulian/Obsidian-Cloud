@@ -109,6 +109,31 @@ export class E2eeService {
   }
 
   /**
+   * The documents the caller can decrypt for which at least one admin (with a
+   * key pair) still lacks a wrapped key. Lets clients backfill admin keys for
+   * just the gaps instead of re-wrapping every document (which, on a large
+   * vault, is hundreds of requests and trips the rate limit). Reveals nothing
+   * new: only ids of documents the caller already holds keys for.
+   */
+  async adminKeyGaps(user: Principal): Promise<{ docIds: string[] }> {
+    const admins = (await this.listAdminKeys()).map((a) => a.userId);
+    if (admins.length === 0) return { docIds: [] };
+    const mine = await this.prisma.documentKey.findMany({
+      where: { userId: user.userId },
+      select: { docId: true },
+    });
+    const docIds = mine.map((m) => m.docId);
+    if (docIds.length === 0) return { docIds: [] };
+    const held = await this.prisma.documentKey.findMany({
+      where: { docId: { in: docIds }, userId: { in: admins } },
+      select: { docId: true },
+    });
+    const count = new Map<string, number>();
+    for (const h of held) count.set(h.docId, (count.get(h.docId) ?? 0) + 1);
+    return { docIds: docIds.filter((d) => (count.get(d) ?? 0) < admins.length) };
+  }
+
+  /**
    * Public keys of every OTHER user who already has read access to this
    * document's subtree — so the caller can wrap a freshly created node's
    * content key for them (a note created in a shared folder). Includes admins
@@ -134,7 +159,7 @@ export class E2eeService {
     const node = await this.prisma.node.findUnique({ where: { docId } });
     if (!node) throw new NotFoundException('Document not found');
     // The plugin folder is readable by everyone; other docs need read.
-    await this.acl.requireReadable(user, node.path);
+    await this.acl.requireCapability(user, node.path, 'read');
 
     const k = await this.prisma.documentKey.findUnique({
       where: { docId_userId: { docId, userId: user.userId } },

@@ -227,6 +227,14 @@ export class RealtimeService implements OnApplicationBootstrap, OnModuleDestroy 
     }
   }
 
+  /** Forward an update persisted via REST to every live connection. */
+  broadcastUpdate(docId: string, payload: Uint8Array): void {
+    const room = this.rooms.get(docId);
+    if (!room) return;
+    const f = this.frame(T_UPDATE, payload);
+    for (const c of room) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(f);
+  }
+
   private broadcast(from: Conn, frame: Buffer): void {
     const room = this.rooms.get(from.docId);
     if (!room) return;

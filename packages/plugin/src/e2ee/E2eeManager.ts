@@ -188,8 +188,15 @@ export class E2eeManager {
       admins.map(async (a) => ({ userId: a.userId, key: await e2.importPublicKey(a.publicKey) })),
     );
 
+    // Only re-key the docs some admin is actually missing (older servers
+    // without the endpoint: all of them).
+    const gaps = await this.http
+      .get<{ docIds: string[] }>('/e2ee/admin-key-gaps')
+      .then((g) => new Set(g.docIds))
+      .catch(() => null);
     let rekeyed = 0;
     for (const [docId, wrapped] of mine) {
+      if (gaps && !gaps.has(docId)) continue;
       let contentKey: CryptoKey;
       try {
         contentKey = await e2.unwrapContentKey(wrapped, this.privateKey);
@@ -211,21 +218,6 @@ export class E2eeManager {
     }
     void rekeyed; // count is informational; the signature gates re-runs
     return signature;
-  }
-
-  /** Wrap a document's content key for a specific set of grantees (used to
-   *  distribute the central plugin folder to all users). No-op without the key. */
-  async keyDocFor(docId: string, grantees: GranteeKeyDto[]): Promise<void> {
-    if (grantees.length === 0) return;
-    const contentKey = await this.getContentKey(docId);
-    if (!contentKey) return;
-    const entries = await Promise.all(
-      grantees.map(async (g) => ({
-        userId: g.userId,
-        wrappedKey: await e2.wrapContentKeyForUser(contentKey, await e2.importPublicKey(g.publicKey)),
-      })),
-    );
-    await this.http.put(`/e2ee/document-keys/${docId}`, { entries });
   }
 
   /** Encrypt a new name with an existing document's content key (rename). */

@@ -71,7 +71,10 @@ export async function clearDocCaches(): Promise<void> {
     await Promise.all(
       list
         .map((d) => d.name)
-        .filter((n): n is string => !!n && n.startsWith('oc-') && n !== DB_NAME)
+        .filter(
+          (n): n is string =>
+            !!n && ((n.startsWith('oc-') && n !== DB_NAME) || n.startsWith('dataview/cache/oc-')),
+        )
         .map(
           (name) =>
             new Promise<void>((resolve) => {

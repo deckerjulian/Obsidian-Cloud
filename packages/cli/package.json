@@ -1,0 +1,19 @@
+{
+  "name": "@oc/cli",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "description": "Command-line tools: encrypted one-shot import of a local Obsidian vault.",
+  "bin": {
+    "oc-import-vault": "./import-vault.mjs"
+  },
+  "scripts": {
+    "import-vault": "node import-vault.mjs"
+  },
+  "dependencies": {
+    "@oc/shared": "workspace:*",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.8"
+  }
+}

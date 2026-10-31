@@ -16,4 +16,8 @@ export class CreateUserDto implements CreateUserRequest {
   @IsOptional()
   @IsBoolean()
   isAdmin?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  isPluginAdmin?: boolean;
 }

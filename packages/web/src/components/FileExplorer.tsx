@@ -42,7 +42,7 @@ export function FileExplorer({
   selectedId: string | null;
   onOpen: (node: TreeNodeDto) => void;
 }) {
-  const { authFetch, treeFetch, user } = useAuth();
+  const { authFetch, treeFetch } = useAuth();
   const { status, prepareName, storeContentKey, keyForGrantees, encryptNameFor, decryptName } =
     useE2ee();
   const api = useMemo(() => treeApi(authFetch), [authFetch]);
@@ -114,63 +114,11 @@ export function FileExplorer({
     [displayNames],
   );
 
-  // The central plugin folder is infrastructure, not notes: visible only to
-  // admins and to users who may change it (they need to manage its content);
-  // pure consumers still pull it via the Obsidian plugin, just without a row
-  // in this tree.
-  const pluginsRoot = useMemo(() => nodes.find((n) => n.systemType === 'plugins'), [nodes]);
-  const visibleNodes = useMemo(() => {
-    // The plugin folder is a web-frontend concern for admins only: they see and
-    // manage it. Every other user still receives the plugins via the Obsidian
-    // plugin (the server ships the subtree in the tree), just without a row here.
-    if (!pluginsRoot || user?.isAdmin) return nodes;
-    const prefix = `${pluginsRoot.path}/`;
-    return nodes.filter((n) => n.id !== pluginsRoot.id && !n.path.startsWith(prefix));
-  }, [nodes, pluginsRoot, user]);
-
   const { forest, root } = useMemo(
-    () => buildForest(visibleNodes, displayNames),
-    [visibleNodes, displayNames],
+    () => buildForest(nodes, displayNames),
+    [nodes, displayNames],
   );
   const rootCanCreate = root ? hasCapability(root.capabilities, 'create') : false;
-
-  const createPluginsFolder = useCallback(async () => {
-    if (status !== 'unlocked') {
-      window.alert('Unlock end-to-end encryption first (status bar, bottom).');
-      return;
-    }
-    if (
-      !window.confirm(
-        'Create the central plugin folder? Obsidian plugins placed in it are ' +
-          'distributed to every user you share it with.',
-      )
-    ) {
-      return;
-    }
-    try {
-      const { encryptedName, contentKey } = await prepareName('plugins');
-      const created = await api.create({
-        parentId: null,
-        kind: 'folder',
-        name: encryptedName,
-        systemType: 'plugins',
-      });
-      if (created.docId) {
-        try {
-          await storeContentKey(created.docId, contentKey);
-        } catch (keyErr) {
-          await api.remove(created.id).catch(() => undefined);
-          throw keyErr;
-        }
-        // The plugin folder is auto-distributed to everyone — key its name for
-        // all users at once (the Obsidian plugin keys its contents on publish).
-        await keyForGrantees(created.docId, contentKey).catch(() => undefined);
-      }
-      await reload();
-    } catch (e) {
-      window.alert((e as Error).message);
-    }
-  }, [api, reload, status, prepareName, storeContentKey, keyForGrantees]);
 
   const toggle = (id: string) =>
     setCollapsed((prev) => {
@@ -273,9 +221,7 @@ export function FileExplorer({
           <span className="oc-tree-icon">
             <Icon
               name={
-                node.systemType === 'plugins'
-                  ? 'package'
-                  : isFolder
+                isFolder
                     ? 'folder'
                     : node.isText
                       ? 'file'
@@ -346,15 +292,6 @@ export function FileExplorer({
               onClick={() => setAclNode(root)}
             >
               <Icon name="share" size={15} />
-            </button>
-          )}
-          {user?.isAdmin && nodes.length > 0 && !pluginsRoot && (
-            <button
-              className="oc-icon-btn"
-              title="Create central plugin folder"
-              onClick={() => void createPluginsFolder()}
-            >
-              <Icon name="package" size={15} />
             </button>
           )}
           <button className="oc-icon-btn" title="Refresh" onClick={() => void reload()}>

@@ -1,3 +1,4 @@
+import { t } from '../i18n';
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
 import { IndexeddbPersistence } from 'y-indexeddb';
@@ -83,8 +84,8 @@ export class DocSession {
     if (!contentKey) {
       new Notice(
         this.plugin.e2ee.unlocked
-          ? `No encryption key for “${this.file.path}” (not shared with you yet).`
-          : `Unlock encryption to open “${this.file.path}”.`,
+          ? t('notice.noKey', { path: this.file.path })
+          : t('notice.unlockToOpen', { path: this.file.path }),
       );
       return false;
     }
@@ -126,7 +127,7 @@ export class DocSession {
     });
 
     if (this.readOnly) {
-      new Notice(`“${this.file.path}” is read-only (viewer access).`);
+      new Notice(t('notice.viewer', { path: this.file.path }));
     }
     return true;
   }
@@ -165,7 +166,7 @@ export class DocSession {
   setReadOnly(readOnly: boolean): void {
     if (this.readOnly === readOnly) return;
     this.readOnly = readOnly;
-    if (readOnly) new Notice(`“${this.file.path}” is now read-only (edit access revoked).`);
+    if (readOnly) new Notice(t('notice.revoked', { path: this.file.path }));
   }
 
   destroy(): void {

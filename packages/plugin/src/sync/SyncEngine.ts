@@ -15,9 +15,11 @@ import type ObsidianCloudPlugin from '../main';
 import { TreeApi } from '../api/TreeApi';
 import { HttpError } from '../api/HttpClient';
 import { DocSession } from './DocSession';
-import { PluginSyncer } from './PluginSync';
+import { ConfigSyncer, SERVER_CONFIG_DIR } from './ConfigSync';
+import { isConfigPath, selectVaultScope } from './vaultScope';
 import { SyncLog, summarizeReport, type SyncReport } from './SyncLog';
 import { askUser, PromptQueue, type PromptOption } from './Prompts';
+import { t } from '../i18n';
 import type { ContentConflict, ConflictChoice } from './VaultBridge';
 
 interface KnownNode {
@@ -47,7 +49,7 @@ type PushKind = 'create' | 'rename' | 'delete' | 'upload';
 export class SyncEngine {
   readonly tree: TreeApi;
   readonly log = new SyncLog();
-  readonly pluginSync: PluginSyncer;
+  readonly configSync: ConfigSyncer;
   private syncing = false;
   private readonly sessions = new Map<string, DocSession>(); // docId -> session
   private readonly knownNodes = new Map<string, KnownNode>(); // path -> node
@@ -82,6 +84,13 @@ export class SyncEngine {
   private seedChain: Promise<void> = Promise.resolve();
   /** Whether the "key all my docs for admins" backfill ran this session. */
   private adminBackfillDone = false;
+  /** Parent id for top-level vault items: the chosen vault node, or null for
+   *  the shared root (legacy mode). Set by every reconcile. */
+  private rootParentId: string | null = null;
+  /** The "choose a vault" prompt was offered this session (don't nag on every poll). */
+  private vaultPrompted = false;
+  /** Last "vault unavailable" message already logged. */
+  private lastScopeError = '';
 
   /** ETag + node cache for the tree poll (304 → reuse last response). */
   private treeEtag: string | null = null;
@@ -95,7 +104,7 @@ export class SyncEngine {
 
   constructor(private readonly plugin: ObsidianCloudPlugin) {
     this.tree = new TreeApi(plugin.http);
-    this.pluginSync = new PluginSyncer(plugin, this.tree);
+    this.configSync = new ConfigSyncer(plugin, this.tree);
   }
 
   // ── lifecycle ────────────────────────────────────────────────────────────
@@ -119,6 +128,8 @@ export class SyncEngine {
     this.knownNodes.clear();
     this.ready = false;
     this.adminBackfillDone = false;
+    this.rootParentId = null;
+    this.vaultPrompted = false;
   }
 
   /** Run `fn` after every queued reconcile/vault-event handler has finished. */
@@ -150,13 +161,17 @@ export class SyncEngine {
       const report = await this.runExclusive(() => this.reconcile());
       this.plugin.setStatus('online');
       this.plugin.markSynced();
-      if (verbose) this.log.success(`Sync complete — ${summarizeReport(report)}`);
+      if (verbose) this.log.success(`${t('initial.done')} — ${summarizeReport(report)}`);
       this.maybePromptReconcileIssues(report);
       return report;
     } catch (err) {
-      this.plugin.setStatus('error');
-      this.log.error(`Sync failed: ${(err as Error).message}`);
-      if (verbose) new Notice(`Obsidian Cloud sync failed: ${(err as Error).message}`);
+      const message = (err as Error).message;
+      // No HTTP answer (network down, DNS, refused) or a gateway error means
+      // the server is unreachable — "offline", not a sync problem.
+      const offline = !(err instanceof HttpError) || err.status >= 502;
+      this.plugin.setStatus(offline ? 'offline' : 'error', message);
+      this.log.error(`${t('status.error')}: ${message}`);
+      if (verbose) new Notice(t('notice.syncFailed', { msg: message }));
       return null;
     } finally {
       this.syncing = false;
@@ -241,7 +256,7 @@ export class SyncEngine {
     // Names are encrypted; without the keys we cannot map server nodes to vault
     // paths. Structure sync therefore requires encryption to be unlocked.
     if (!this.plugin.e2ee.unlocked) {
-      this.log.info('Encryption locked — unlock to synchronize the vault.');
+      this.log.info(`${t('status.locked')} — ${t('status.locked.detail')}`);
       this.ready = false;
       return report;
     }
@@ -257,21 +272,56 @@ export class SyncEngine {
     // interpreted as a deletion — so a fresh device never wipes the server.
     const initialSync = !settings.initialSyncDone;
 
-    // System subtrees (central plugin folder) never materialize as vault
-    // files — they sync against .obsidian/ via the PluginSyncer instead.
-    const systemIds = new Set(nodes.filter((n) => n.systemType).map((n) => n.id));
-    if (systemIds.size > 0) {
-      for (const n of [...nodes].sort((a, b) => a.depth - b.depth)) {
-        if (n.parentId && systemIds.has(n.parentId)) systemIds.add(n.id);
+    // Which server subtree this local vault mirrors. Nothing syncs until the
+    // user picked a vault (or explicitly the legacy shared root): a fresh
+    // install must never pull whatever happens to sit at the server root.
+    if (!settings.vaultId && !settings.legacyRoot) {
+      this.log.info(t('status.noVault.detail'));
+      this.ready = false;
+      if (!this.vaultPrompted) {
+        this.vaultPrompted = true;
+        void this.plugin.promptVaultChoice(false);
+      }
+      return report;
+    }
+    // In legacy mode (no vault chosen) vault subtrees are excluded.
+    const scope = selectVaultScope(nodes, settings.vaultId);
+    if (!scope.found) {
+      // Deleted, or access revoked. Treating the empty result as "everything
+      // was deleted on the server" would trash the whole local vault.
+      const msg = t('sync.vaultGone', { vault: settings.vaultName ?? settings.vaultId ?? '' });
+      report.errors.push(msg);
+      // The poll repeats every few seconds; log once per distinct situation.
+      if (msg !== this.lastScopeError) this.log.error(msg);
+      this.lastScopeError = msg;
+      this.ready = false;
+      return report;
+    }
+    this.lastScopeError = '';
+    this.rootParentId = scope.rootParentId;
+
+    const { paths: allPaths, failures: decryptFailures } = await this.buildServerPaths(scope.nodes);
+    // The vault's config folder (.obsidian) syncs separately (ConfigSyncer):
+    // never pulled into the vault, never mistaken for deletions.
+    const configDirs = [SERVER_CONFIG_DIR, vault.configDir];
+    // The server-protected config folder (systemType 'config') is the one the
+    // config push targets; any other `.obsidian` is ignored but never pulled.
+    const protectedRoot = scope.nodes.find((n) => n.systemType === 'config' && n.parentId === settings.vaultId);
+    const configNodes = new Map<string, TreeNodeDto>();
+    const configIds = new Set<string>();
+    for (const n of scope.nodes) {
+      const p = allPaths.get(n.id);
+      if (p !== undefined && isConfigPath(p, configDirs)) {
+        configIds.add(n.id);
+        const inProtected = !protectedRoot || n.id === protectedRoot.id || n.path.startsWith(`${protectedRoot.path}/`);
+        if (inProtected) configNodes.set(p, n);
       }
     }
-    const vaultNodes = systemIds.size > 0 ? nodes.filter((n) => !systemIds.has(n.id)) : nodes;
-
-    const { paths: serverPaths, failures: decryptFailures } = await this.buildServerPaths(vaultNodes);
+    const vaultNodes = configIds.size > 0 ? scope.nodes.filter((n) => !configIds.has(n.id)) : scope.nodes;
+    const serverPaths =
+      configIds.size > 0 ? new Map([...allPaths].filter(([id]) => !configIds.has(id))) : allPaths;
     if (decryptFailures > 0) {
-      const msg =
-        `${decryptFailures} server item(s) skipped — names could not be decrypted ` +
-        '(no key shared with you, or an empty name). Deletions and uploads are paused this run.';
+      const msg = t('sync.undecryptable', { n: decryptFailures });
       report.errors.push(msg);
       // The poll repeats every few seconds; only log when the situation changes.
       if (decryptFailures !== this.lastDecryptFailures) this.log.error(msg);
@@ -294,7 +344,7 @@ export class SyncEngine {
           this.ignoreOnce(oldPath);
           this.ignoreOnce(newPath);
           await this.plugin.app.fileManager.renameFile(af, newPath);
-          this.log.info(`↔ moved ${oldPath} → ${newPath} (renamed on server)`);
+          this.log.info(t('log.moved', { from: oldPath, to: newPath }));
         } catch (err) {
           // The rename didn't happen — its consume-once markers must not
           // survive to swallow a later, real user rename of these paths.
@@ -384,7 +434,7 @@ export class SyncEngine {
         }
         deletedOfflineIds.add(node.id);
         report.removed++;
-        this.log.info(`✗ deleted on server (removed locally while offline): ${path}`);
+        this.log.info(t('log.deletedOffline', { path }));
       }
     }
 
@@ -400,7 +450,7 @@ export class SyncEngine {
           if (!(existing instanceof TFolder)) {
             await this.ensureFolder(path);
             report.foldersCreated++;
-            this.log.info(`↓ folder ${path}`);
+            this.log.info(t('log.downFolder', { path }));
           }
         } else if (!(existing instanceof TFile)) {
           if (node.isText) {
@@ -408,7 +458,7 @@ export class SyncEngine {
             this.ignoreOnce(path);
             await vault.create(path, '');
             report.filesCreated++;
-            this.log.info(`↓ note ${path}`);
+            this.log.info(t('log.downNote', { path }));
           } else {
             // Binary attachment: download + decrypt (no empty placeholders).
             await this.downloadBlobToVault(node, path, report);
@@ -434,7 +484,7 @@ export class SyncEngine {
           this.ignoreOnce(tracked);
           await vault.trash(af, false);
           report.removed++;
-          this.log.info(`✗ removed ${tracked} (deleted on server)`);
+          this.log.info(t('log.removed', { path: tracked }));
         } catch (err) {
           // Failed trash: drop the marker, or it would eat the user's next
           // real deletion of this path (leaving the server node alive).
@@ -507,13 +557,15 @@ export class SyncEngine {
       await this.plugin.saveSettings();
     }
 
-    // Central plugin folder → .obsidian/plugins (never into the vault).
-    try {
-      await this.pluginSync.run(nodes);
-    } catch (err) {
-      const msg = `Plugin sync failed: ${(err as Error).message}`;
-      report.errors.push(msg);
-      this.log.error(msg);
+    // This vault's .obsidian → the server vault's config folder (one-way), so
+    // the web app runs the same plugins/settings. Only on clean runs: an
+    // undecryptable config node could otherwise be duplicated.
+    if (settings.vaultId && decryptFailures === 0) {
+      try {
+        await this.configSync.run(settings.vaultId, nodes, configNodes);
+      } catch (err) {
+        this.log.error(`Config sync failed: ${(err as Error).message}`);
+      }
     }
 
     // Ensure admins hold keys for the docs this user can decrypt (admins read
@@ -570,7 +622,7 @@ export class SyncEngine {
       this.ignoreOnce(path);
       await this.plugin.app.vault.createBinary(path, bytes.slice().buffer as ArrayBuffer);
       report.filesCreated++;
-      this.log.info(`↓ attachment ${path}`);
+      this.log.info(t('log.downFile', { path }));
     } catch (err) {
       if (err instanceof HttpError && err.status === 404) {
         // Node exists but no content was uploaded yet — never create an empty
@@ -599,7 +651,7 @@ export class SyncEngine {
     if (!contentBase64) throw new Error('encryption key unavailable');
     await this.plugin.http.put(`/documents/${docId}/blob`, { contentBase64 });
     this.emptyBlobsNoted.delete(docId);
-    this.log.success(`↑ uploaded attachment: ${path}`);
+    this.log.success(t('log.upFile', { path }));
   }
 
   private scheduleBlobUpload(path: string, docId: string, file: TFile): void {
@@ -644,7 +696,7 @@ export class SyncEngine {
     const path = normalizePath(file.path);
     const kind: NodeKind = file instanceof TFolder ? 'folder' : 'file';
     const parent = parentPath(path);
-    const parentId = parent === '' ? null : (this.knownNodes.get(parent)?.id ?? null);
+    const parentId = parent === '' ? this.rootParentId : (this.knownNodes.get(parent)?.id ?? null);
     if (parent !== '' && parentId === null) throw new Error('parent folder is not synced yet');
 
     const fileName = basename(path);
@@ -690,7 +742,7 @@ export class SyncEngine {
         await this.uploadBlob(path, created.docId, file);
       }
     }
-    this.log.success(`↑ created on server: ${path}`);
+    this.log.success(t('log.upCreated', { path }));
   }
 
   handleCreate(file: TAbstractFile): Promise<void> {
@@ -764,7 +816,7 @@ export class SyncEngine {
       delete this.plugin.settings.docIds[path];
     }
     await this.plugin.saveSettings();
-    this.log.success(`↑ deleted on server: ${path}`);
+    this.log.success(t('log.upDeleted', { path }));
   }
 
   handleRename(file: TAbstractFile, oldPath: string): Promise<void> {
@@ -817,7 +869,8 @@ export class SyncEngine {
     const newParent = parentPath(newPath);
     if (oldParent !== newParent) {
       if (newParent === '') {
-        body.parentId = null;
+        // Top level of the local vault = the vault node (null = shared root).
+        body.parentId = this.rootParentId;
       } else {
         const parentNode = this.knownNodes.get(newParent);
         // NEVER fall back to null here: parentId null means "vault root" to
@@ -845,7 +898,7 @@ export class SyncEngine {
     }
     this.remapSubtree(old, newPath);
     await this.plugin.saveSettings();
-    this.log.success(`↑ renamed on server: ${old} → ${newPath}`);
+    this.log.success(t('log.upRenamed', { from: old, to: newPath }));
   }
 
   private remapSubtree(oldPath: string, newPath: string): void {
@@ -875,14 +928,13 @@ export class SyncEngine {
     }
     const choice = await this.prompts.run(() =>
       askUser<'server' | 'local' | 'both'>(this.plugin.app, {
-        title: 'Sync conflict',
-        message:
-          `“${conflict.path}” was changed both in this vault and on the server.\n\n` +
-          'How should it be resolved?',
+        title: t('conflict.title'),
+        icon: 'git-merge|git-compare',
+        message: t('conflict.message', { path: conflict.path }),
         options: [
-          { key: 'both', label: 'Keep both (conflict copy)', cta: true },
-          { key: 'server', label: 'Use server version' },
-          { key: 'local', label: 'Use local version' },
+          { key: 'both', label: t('conflict.both'), cta: true },
+          { key: 'server', label: t('conflict.server') },
+          { key: 'local', label: t('conflict.local') },
         ],
       }),
     );
@@ -904,7 +956,7 @@ export class SyncEngine {
     const msg = `Could not sync “${path}”: ${err.message}`;
     this.log.error(msg);
     if (!this.plugin.settings.askOnConflict) {
-      new Notice(`Obsidian Cloud: ${msg}`);
+      new Notice(t('notice.problem', { msg }));
       return;
     }
     const key = `${kind}:${path}`;
@@ -913,15 +965,15 @@ export class SyncEngine {
 
     void this.prompts.run(async () => {
       const options: Array<PromptOption<'retry' | 'later' | 'ignore'>> = [
-        { key: 'retry', label: 'Retry now', cta: true },
-        { key: 'later', label: 'Decide later' },
+        { key: 'retry', label: t('problem.retry'), cta: true },
+        { key: 'later', label: t('problem.later') },
       ];
       if (kind === 'create' || kind === 'upload') {
-        options.push({ key: 'ignore', label: 'Never sync this file', warning: true });
+        options.push({ key: 'ignore', label: t('problem.ignore'), warning: true });
       }
       const choice = await askUser(this.plugin.app, {
-        title: 'Sync problem',
-        message: `${msg}\n\nHow should this be handled?`,
+        title: t('problem.title'),
+        message: t('problem.message', { path, msg: err.message }),
         options,
       });
       this.pendingIssues.delete(key);
@@ -933,7 +985,7 @@ export class SyncEngine {
           this.mutedIssues.add(key);
           const m = `Still failing for “${path}”: ${(retryErr as Error).message}`;
           this.log.error(m);
-          new Notice(`Obsidian Cloud: ${m}`);
+          new Notice(t('notice.problem', { msg: m }));
         }
       } else if (choice === 'ignore') {
         this.plugin.settings.ignoredPaths.push(path);
@@ -958,16 +1010,14 @@ export class SyncEngine {
 
     void this.prompts.run(async () => {
       const details = report.errors.slice(0, 8);
-      if (report.errors.length > 8) details.push(`…and ${report.errors.length - 8} more`);
+      if (report.errors.length > 8) details.push(t('problems.more', { n: report.errors.length - 8 }));
       const choice = await askUser<'retry' | 'later'>(this.plugin.app, {
-        title: 'Sync problems',
-        message:
-          `${report.errors.length} item(s) could not be synchronized ` +
-          '(see the sync log in the settings for the full list).\n\nHow should this be handled?',
+        title: t('problems.title'),
+        message: t('problems.message', { n: report.errors.length }),
         details,
         options: [
-          { key: 'retry', label: 'Retry sync', cta: true },
-          { key: 'later', label: 'Not now' },
+          { key: 'retry', label: t('problems.retry'), cta: true },
+          { key: 'later', label: t('action.notNow') },
         ],
       });
       if (choice === 'retry') void this.syncNow();
@@ -985,7 +1035,7 @@ export class SyncEngine {
     const session = new DocSession(this.plugin, file, docId, {
       resolveConflict: (c) => this.resolveContentConflict(c),
       onDeferred: () => this.closeSession(docId), // reopening the file asks again
-      onSeeded: () => this.log.info(`● live: ${path}`),
+      onSeeded: () => this.log.info(t('log.live', { path })),
       onError: (m) => this.log.error(m),
     });
     this.sessions.set(docId, session);
@@ -1141,8 +1191,8 @@ export class SyncEngine {
     const current = new Uint8Array(await this.plugin.app.vault.readBinary(file));
     if (current.byteLength === bytes.byteLength && current.every((b, i) => b === bytes[i])) return;
     await this.plugin.app.vault.modifyBinary(file, bytes.slice().buffer as ArrayBuffer);
-    this.log.info(`↩ reverted ${path} (no edit permission)`);
-    new Notice(`“${path}” is read-only — your local change was reverted.`);
+    this.log.info(t('log.reverted', { path }));
+    new Notice(t('notice.reverted', { path }));
   }
 
   private scheduleBlobRevert(path: string, docId: string, file: TFile): void {

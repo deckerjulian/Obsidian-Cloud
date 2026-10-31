@@ -44,6 +44,12 @@ export class E2eeController {
     return this.e2ee.listAdminKeys();
   }
 
+  /** Docs the caller holds a key for but some admin does not (backfill work list). */
+  @Get('admin-key-gaps')
+  adminKeyGaps(@CurrentUser() user: AuthUser): Promise<{ docIds: string[] }> {
+    return this.e2ee.adminKeyGaps(user);
+  }
+
   /** All wrapped content keys of the current user (bulk cache prime for sync). */
   @Get('document-keys')
   myDocumentKeys(@CurrentUser() user: AuthUser): Promise<DocumentKeyDto[]> {

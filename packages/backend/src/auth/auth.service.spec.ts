@@ -12,6 +12,7 @@ const USER: User = {
   passwordHash: null,
   externalId: 'uid=alice,ou=people,dc=example,dc=org',
   isAdmin: false,
+  isPluginAdmin: false,
   createdAt: new Date(),
 };
 

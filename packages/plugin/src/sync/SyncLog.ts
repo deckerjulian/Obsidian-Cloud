@@ -1,3 +1,4 @@
+import { t } from '../i18n';
 export type SyncLogLevel = 'info' | 'success' | 'error';
 
 export interface SyncLogEntry {
@@ -58,9 +59,9 @@ export interface SyncReport {
 }
 
 export function summarizeReport(r: SyncReport): string {
-  const parts = [`${r.foldersCreated} folders`, `${r.filesCreated} notes`];
-  if (r.pushed) parts.push(`${r.pushed} uploaded`);
-  if (r.removed) parts.push(`${r.removed} removed`);
-  if (r.errors.length) parts.push(`${r.errors.length} errors`);
+  const parts = [`${r.foldersCreated} ${t('initial.stat.folders')}`, `${r.filesCreated} ${t('initial.stat.notes')}`];
+  if (r.pushed) parts.push(`${r.pushed} ${t('initial.stat.uploaded')}`);
+  if (r.removed) parts.push(`${r.removed} ${t('log.stat.removed')}`);
+  if (r.errors.length) parts.push(`${r.errors.length} ${t('initial.stat.errors')}`);
   return parts.join(', ');
 }

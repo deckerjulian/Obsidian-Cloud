@@ -84,7 +84,8 @@ services:
       web:
         condition: service_started
     ports:
-      - '8080:8080'
+      # Loopback only: a host reverse proxy (nginx) fronts it in production.
+      - '127.0.0.1:8080:8080'
       # For a production domain, the Caddyfile switches to automatic HTTPS,
       # which needs ports 80 (ACME challenge) and 443 published as well:
       # - '80:80'

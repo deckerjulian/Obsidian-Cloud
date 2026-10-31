@@ -1,4 +1,5 @@
-import { App, Modal, Setting } from 'obsidian';
+import { App, Modal } from 'obsidian';
+import { button, modalHeader } from '../ui/components';
 
 export interface PromptOption<T extends string = string> {
   key: T;
@@ -11,6 +12,8 @@ export interface PromptOption<T extends string = string> {
 
 export interface PromptSpec<T extends string = string> {
   title: string;
+  /** Lucide icon for the title (default: warning triangle). */
+  icon?: string;
   message: string;
   /** Optional list of items (e.g. affected paths) rendered under the message. */
   details?: string[];
@@ -54,27 +57,26 @@ class PromptModal<T extends string> extends Modal {
   }
 
   onOpen(): void {
+    modalHeader(this, this.spec.icon ?? 'triangle-alert|alert-triangle', this.spec.title);
     const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h3', { text: this.spec.title });
     for (const paragraph of this.spec.message.split('\n\n')) {
       contentEl.createEl('p', { text: paragraph });
     }
     if (this.spec.details?.length) {
-      const list = contentEl.createEl('ul');
-      list.style.cssText =
-        'max-height:180px;overflow:auto;font-family:var(--font-monospace);font-size:12px;';
+      const list = contentEl.createEl('ul', { cls: 'oc-details' });
       for (const detail of this.spec.details) list.createEl('li', { text: detail });
     }
-
-    const buttons = new Setting(contentEl);
-    for (const option of this.spec.options) {
-      buttons.addButton((b) => {
-        b.setButtonText(option.label).onClick(() => this.finish(option.key));
-        if (option.cta) b.setCta();
-        if (option.warning) b.setWarning();
-        return b;
+    // Long labels side by side get cramped — stack them.
+    const stacked = this.spec.options.length > 2;
+    const buttons = contentEl.createDiv({ cls: `oc-buttons${stacked ? ' is-stacked' : ''}` });
+    const ordered = stacked ? this.spec.options : [...this.spec.options].reverse();
+    for (const option of ordered) {
+      const b = button(buttons, option.label, {
+        cta: option.cta,
+        warning: option.warning,
+        onClick: () => this.finish(option.key),
       });
+      if (option.cta) window.setTimeout(() => b.focus(), 0);
     }
   }
 

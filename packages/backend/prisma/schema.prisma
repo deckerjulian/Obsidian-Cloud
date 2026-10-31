@@ -41,6 +41,8 @@ model User {
   passwordHash String? // null for directory (LDAP/AD) accounts
   externalId   String?    @unique // LDAP DN / AD objectGUID or userPrincipalName
   isAdmin      Boolean    @default(false)
+  // May change vaults' Obsidian config (community plugins) in the cloud.
+  isPluginAdmin Boolean   @default(false)
   createdAt    DateTime   @default(now())
 
   acl     AclEntry[]
@@ -82,16 +84,22 @@ model Node {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // Non-null for system folders (e.g. 'plugins' = the central Obsidian
-  // plugin folder). At most one node per type (unique index; NULLs are
-  // exempt in Postgres), admin-only mutation enforced in NodesService.
-  systemType String? @unique
+  // Non-null for system folders: 'config' = a vault's `.obsidian` folder
+  // (community plugins etc.). At most one per type and parent (NULLs are
+  // exempt in Postgres); only admins / plugin admins may change its subtree
+  // (enforced in AclService.effectiveCapabilities).
+  systemType String?
+
+  // A vault: a top-level folder that is the root of one Obsidian vault
+  // (desktop clients sync exactly one vault; the web switches between them).
+  isVault Boolean @default(false)
 
   acl          AclEntry[]
   blob         Blob?
   documentKeys DocumentKey[]
   docUpdates   DocUpdate[]
 
+  @@unique([parentId, systemType])
   @@index([parentId])
   @@map("nodes")
 }

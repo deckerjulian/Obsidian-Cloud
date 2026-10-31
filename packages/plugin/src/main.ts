@@ -1,4 +1,4 @@
-import { Menu, Notice, Plugin, TFile, editorInfoField, setIcon, type TAbstractFile } from 'obsidian';
+import { Menu, Notice, Plugin, TFile, editorInfoField, type TAbstractFile } from 'obsidian';
 import { EditorState } from '@codemirror/state';
 import { ObsidianCloudSettings, DEFAULT_SETTINGS, ObsidianCloudSettingTab } from './settings';
 import { HttpClient } from './api/HttpClient';
@@ -9,8 +9,14 @@ import { SyncEngine } from './sync/SyncEngine';
 import { InitialSyncModal } from './sync/InitialSyncModal';
 import { E2eeManager } from './e2ee/E2eeManager';
 import { EncryptionModal } from './e2ee/EncryptionModal';
+import { chooseVault, type VaultChoice } from './sync/VaultPicker';
+import { DEVICE_STATE_STORAGE_KEY, mergeDeviceState, splitDeviceState } from './deviceState';
+import { t } from './i18n';
+import { describeStatus, type E2eeState, type NextAction, type StatusInput, type SyncStatus } from './ui/status';
+import { PLUGIN_CSS } from './ui/styles';
+import { SyncLogModal, setIconSafe } from './ui/components';
 
-export type SyncStatus = 'offline' | 'online' | 'syncing' | 'error';
+export type { SyncStatus } from './ui/status';
 
 export default class ObsidianCloudPlugin extends Plugin {
   settings!: ObsidianCloudSettings;
@@ -25,9 +31,12 @@ export default class ObsidianCloudPlugin extends Plugin {
    *  waits for this so an un-indexed file is never mistaken for a deletion. */
   layoutReady = false;
   private syncState: SyncStatus = 'offline';
-  private e2eeState: 'unknown' | 'not-setup' | 'locked' | 'unlocked' = 'unknown';
+  private e2eeState: E2eeState = 'unknown';
   private lastSyncedAt: number | null = null;
+  private lastError: string | null = null;
+  private readonly stateListeners = new Set<() => void>();
   private lastReadOnlyNoticeAt = 0;
+  private vaultPickerOpen = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -48,32 +57,43 @@ export default class ObsidianCloudPlugin extends Plugin {
 
     this.statusBar = this.addStatusBarItem();
     this.statusBar.addClass('mod-clickable');
-    this.statusBar.style.cursor = 'pointer';
-    this.statusBar.setAttribute('aria-label', 'Obsidian Cloud');
+    this.statusBar.setAttribute('data-tooltip-position', 'top');
     this.registerDomEvent(this.statusBar, 'click', (evt) => this.showMenu(evt));
     this.injectStyles();
     this.setStatus('offline');
+    // Keep "synced 3 minutes ago" current.
+    this.registerInterval(window.setInterval(() => this.renderStatusBar(), 30_000));
 
     this.addRibbonIcon('cloud', 'Obsidian Cloud', (evt) => this.showMenu(evt));
     this.addCommand({
       id: 'sign-in-out',
-      name: 'Sign in / out',
+      name: t('cmd.signInOut'),
       callback: () => void this.toggleAuth(),
     });
     this.addCommand({
       id: 'sync-now',
-      name: 'Sync now',
+      name: t('cmd.syncNow'),
       callback: () => void this.syncEngine.syncNow(),
     });
     this.addCommand({
       id: 'encryption',
-      name: 'Set up / unlock encryption',
-      callback: () => void this.promptEncryption(),
+      name: t('cmd.encryption'),
+      callback: () => void this.promptEncryption(true),
     });
     this.addCommand({
-      id: 'publish-plugin',
-      name: 'Publish a plugin to the central folder',
-      callback: () => void this.syncEngine.pluginSync.publish(),
+      id: 'choose-vault',
+      name: t('cmd.chooseVault'),
+      callback: () => void this.promptVaultChoice(true),
+    });
+    this.addCommand({
+      id: 'open-in-web',
+      name: t('cmd.openWeb'),
+      callback: () => this.openInWeb(this.app.workspace.getActiveFile()?.path),
+    });
+    this.addCommand({
+      id: 'show-log',
+      name: t('cmd.showLog'),
+      callback: () => new SyncLogModal(this.app, this.syncEngine.log).open(),
     });
 
     // Enforce server permissions in the editor: without the 'edit' capability
@@ -151,17 +171,6 @@ export default class ObsidianCloudPlugin extends Plugin {
     console.log('Obsidian-Cloud plugin unloaded');
   }
 
-  openAuthUi(): void {
-    if (this.authClient.hasSession()) {
-      new Notice(
-        `Signed in as ${this.settings.accountEmail ?? 'unknown'}. ` +
-          'Use the "Sign in / out" command to sign out.',
-      );
-    } else {
-      new LoginModal(this.app, this, () => void this.onSignedIn()).open();
-    }
-  }
-
   async toggleAuth(): Promise<void> {
     if (this.authClient.hasSession()) {
       this.syncEngine.stop();
@@ -173,10 +182,11 @@ export default class ObsidianCloudPlugin extends Plugin {
       // path as "deleted on the server" and mass-trash local files.
       this.settings.trackedPaths = [];
       this.settings.docIds = {};
+      this.settings.configPushed = {};
       await this.saveSettings();
       this.setStatus('offline');
       this.refreshSettingsTab();
-      new Notice('Signed out.');
+      new Notice(t('notice.signedOut'));
     } else {
       new LoginModal(this.app, this, () => void this.onSignedIn()).open();
     }
@@ -186,7 +196,10 @@ export default class ObsidianCloudPlugin extends Plugin {
   private async onSignedIn(): Promise<void> {
     this.setStatus('online');
     this.refreshSettingsTab();
-    if (!this.settings.initialSyncDone) {
+    // Without a chosen vault, start() only polls; the first unlocked reconcile
+    // offers the vault picker, which then runs the initial sync itself.
+    const vaultChosen = !!this.settings.vaultId || this.settings.legacyRoot;
+    if (vaultChosen && !this.settings.initialSyncDone) {
       new InitialSyncModal(this.app, this).open();
     } else {
       await this.syncEngine.start();
@@ -195,12 +208,73 @@ export default class ObsidianCloudPlugin extends Plugin {
   }
 
   /**
+   * Ask which server vault this local vault mirrors (requires sign-in and
+   * unlocked encryption — vault names are encrypted). `force` = opened by the
+   * user, so explain why it can't open instead of failing silently.
+   */
+  async promptVaultChoice(force: boolean): Promise<void> {
+    if (this.vaultPickerOpen) return;
+    if (!this.authClient.hasSession()) {
+      if (force) new Notice(t('notice.signInFirst'));
+      return;
+    }
+    if (!this.e2ee.unlocked) {
+      if (force) new Notice(t('notice.unlockFirst'));
+      return;
+    }
+    this.vaultPickerOpen = true;
+    let choice: VaultChoice | null;
+    try {
+      choice = await chooseVault(this);
+    } catch (err) {
+      new Notice(t('notice.vaultsFailed', { msg: (err as Error).message }));
+      return;
+    } finally {
+      this.vaultPickerOpen = false;
+    }
+    if (choice) await this.selectVault(choice);
+  }
+
+  /**
+   * Switch the server vault. The sync bookkeeping belongs to the previous
+   * vault — kept, every tracked path would look "deleted on the server" and be
+   * trashed locally — so it is reset and the next sync is a fresh, merge-only
+   * initial sync.
+   */
+  async selectVault(choice: VaultChoice): Promise<void> {
+    const s = this.settings;
+    const same =
+      choice.kind === 'vault' ? s.vaultId === choice.id : !s.vaultId && s.legacyRoot;
+    if (same) {
+      if (choice.kind === 'vault') s.vaultName = choice.name;
+      await this.saveSettings();
+      this.refreshSettingsTab();
+      void this.syncEngine.syncNow();
+      return;
+    }
+    this.syncEngine.stop();
+    s.vaultId = choice.kind === 'vault' ? choice.id : null;
+    s.vaultName = choice.kind === 'vault' ? choice.name : null;
+    s.legacyRoot = choice.kind === 'legacy';
+    s.trackedPaths = [];
+    s.docIds = {};
+    s.configPushed = {};
+    s.initialSyncDone = false;
+    await this.saveSettings();
+    this.refreshSettingsTab();
+    new InitialSyncModal(this.app, this).open();
+  }
+
+  /**
    * Ensure end-to-end encryption is set up and unlocked on this device. Opens a
    * passphrase modal when needed; structure sync works regardless, but note
    * content can only be decrypted once unlocked.
    */
-  async promptEncryption(): Promise<void> {
-    if (!this.authClient.hasSession()) return;
+  async promptEncryption(force = false): Promise<void> {
+    if (!this.authClient.hasSession()) {
+      if (force) new Notice(t('notice.signInFirst'));
+      return;
+    }
     if (this.e2ee.unlocked) {
       this.setE2eeState('unlocked');
       return;
@@ -227,6 +301,7 @@ export default class ObsidianCloudPlugin extends Plugin {
 
   refreshSettingsTab(): void {
     this.settingTab?.refresh();
+    this.stateChanged();
   }
 
   /** Rejected-edit feedback, throttled so held-down keys don't stack notices. */
@@ -234,115 +309,172 @@ export default class ObsidianCloudPlugin extends Plugin {
     const now = Date.now();
     if (now - this.lastReadOnlyNoticeAt < 2000) return;
     this.lastReadOnlyNoticeAt = now;
-    new Notice(`“${path}” is read-only — you don't have edit permission.`);
+    new Notice(t('notice.readOnly', { path }));
   }
 
-  setStatus(state: SyncStatus): void {
+  // ── status ────────────────────────────────────────────────────────────────
+  setStatus(state: SyncStatus, error?: string): void {
     this.syncState = state;
-    this.renderStatusBar();
+    if (state === 'online') this.lastError = null;
+    else if (error) this.lastError = error;
+    this.stateChanged();
   }
 
-  setE2eeState(s: 'unknown' | 'not-setup' | 'locked' | 'unlocked'): void {
+  setE2eeState(s: E2eeState): void {
     this.e2eeState = s;
-    this.renderStatusBar();
+    this.stateChanged();
   }
 
-  /** Record a successful sync and refresh the status bar. */
+  /** Record a successful sync and refresh the status UI. */
   markSynced(): void {
     this.lastSyncedAt = Date.now();
+    this.stateChanged();
+  }
+
+  /** Inputs of the status UI (status bar, menu, settings card). */
+  statusInput(): StatusInput {
+    const s = this.settings;
+    return {
+      signedIn: this.authClient?.hasSession() ?? false,
+      e2ee: this.e2ee?.unlocked ? 'unlocked' : this.e2eeState,
+      vaultName: s.vaultId ? (s.vaultName ?? s.vaultId) : s.legacyRoot ? t('vault.legacy') : null,
+      initialSyncDone: s.initialSyncDone,
+      sync: this.syncState,
+      lastSyncedAt: this.lastSyncedAt,
+      lastError: this.lastError,
+    };
+  }
+
+  /** Subscribe to status changes (settings tab). Returns an unsubscribe. */
+  onStateChange(fn: () => void): () => void {
+    this.stateListeners.add(fn);
+    return () => this.stateListeners.delete(fn);
+  }
+
+  private stateChanged(): void {
     this.renderStatusBar();
+    for (const fn of this.stateListeners) fn();
+  }
+
+  /** Run the next step a status suggests (status card / menu button). */
+  runAction(action: NextAction): void {
+    switch (action) {
+      case 'signIn':
+        void this.toggleAuth();
+        break;
+      case 'setUpEncryption':
+      case 'unlock':
+        void this.promptEncryption(true);
+        break;
+      case 'chooseVault':
+        void this.promptVaultChoice(true);
+        break;
+      case 'startSync':
+        new InitialSyncModal(this.app, this).open();
+        break;
+      case 'retry':
+        void this.syncEngine.syncNow();
+        break;
+    }
+  }
+
+  actionLabel(action: NextAction): string {
+    return {
+      signIn: t('action.signIn'),
+      setUpEncryption: t('action.setUpEncryption'),
+      unlock: t('action.unlock'),
+      chooseVault: t('action.chooseVault'),
+      startSync: t('action.startSync'),
+      retry: t('action.retry'),
+    }[action ?? 'retry'];
+  }
+
+  /** The web app at this vault (and note, if given). */
+  webUrl(path?: string | null): string | null {
+    const s = this.settings;
+    if (!s.serverUrl) return null;
+    if (!s.vaultId) return s.serverUrl;
+    return `${s.serverUrl}/#/vault/${s.vaultId}${path ? `/${encodeURIComponent(path)}` : ''}`;
+  }
+
+  openInWeb(path?: string | null): void {
+    if (!this.settings.vaultId) {
+      new Notice(t('notice.noWeb'));
+      return;
+    }
+    const url = this.webUrl(path);
+    if (url) window.open(url);
+  }
+
+  lockEncryption(): void {
+    this.e2ee.lock();
+    this.setE2eeState('locked');
+    new Notice(t('notice.locked'));
+    this.refreshSettingsTab();
   }
 
   private injectStyles(): void {
     const style = document.createElement('style');
-    style.textContent =
-      '@keyframes oc-spin{to{transform:rotate(360deg)}}' +
-      '.oc-statusbar-item{display:inline-flex;align-items:center;gap:5px}' +
-      '.oc-statusbar-item svg{width:13px;height:13px}' +
-      '.oc-spin{animation:oc-spin 1s linear infinite;display:inline-flex}';
+    style.id = 'obsidian-cloud-styles';
+    style.textContent = PLUGIN_CSS;
     document.head.appendChild(style);
     this.register(() => style.remove());
   }
 
   private renderStatusBar(): void {
     const el = this.statusBar;
-    if (!el) return;
+    if (!el || !this.settings) return;
+    const v = describeStatus(this.statusInput());
     el.empty();
-    el.addClass('oc-statusbar-item');
-
-    // Sync indicator: spinner while syncing, otherwise a coloured dot.
-    const sync = el.createSpan();
-    if (this.syncState === 'syncing') {
-      setIcon(sync, 'refresh-cw');
-      sync.addClass('oc-spin');
-      sync.style.color = 'var(--text-accent)';
-    } else {
-      const dot = sync.createSpan({ text: '●' });
-      dot.style.color =
-        this.syncState === 'online'
-          ? 'var(--color-green)'
-          : this.syncState === 'error'
-            ? 'var(--color-red)'
-            : 'var(--text-faint)';
-    }
-    el.createSpan({ text: this.syncState === 'offline' ? 'Cloud offline' : 'Cloud' });
-
-    // Last synchronised time.
-    if (this.lastSyncedAt && this.syncState !== 'offline') {
-      const t = new Date(this.lastSyncedAt).toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-      el.createSpan({ text: `· ${t}` }).style.color = 'var(--text-faint)';
-    }
-
-    // E2EE indicator: green lock when active (unlocked), red when not.
-    if (this.e2eeState !== 'unknown') {
-      el.createSpan({ text: '·' }).style.color = 'var(--text-faint)';
-      const lock = el.createSpan();
-      const active = this.e2eeState === 'unlocked';
-      setIcon(lock, active ? 'unlock' : 'lock');
-      lock.style.color = active ? 'var(--color-green)' : 'var(--color-red)';
-    }
-
-    const lastTxt = this.lastSyncedAt ? new Date(this.lastSyncedAt).toLocaleString() : 'never';
-    const e2eeTxt = {
-      unknown: '—',
-      'not-setup': 'not set up',
-      locked: 'locked',
-      unlocked: 'on',
-    }[this.e2eeState];
-    el.setAttribute(
-      'aria-label',
-      `Obsidian Cloud: ${this.syncState}\nEncryption: ${e2eeTxt}\nLast synchronised: ${lastTxt}`,
-    );
+    el.className = `status-bar-item plugin-obsidian-cloud mod-clickable oc-statusbar is-${v.tone}`;
+    const ic = el.createSpan({ cls: `oc-sb-icon${v.tone === 'busy' ? ' oc-spin' : ''}` });
+    setIconSafe(ic, v.icon);
+    el.createSpan({ text: v.short });
+    el.setAttribute('aria-label', t('status.tooltip', { title: v.title, detail: v.detail }));
   }
 
-  /** Cloud menu (status-bar / ribbon click): sync, encryption, settings, sign in/out. */
+  /** Cloud menu (status-bar / ribbon click): status, next step, common actions. */
   showMenu(evt: MouseEvent): void {
+    const v = describeStatus(this.statusInput());
+    const signedIn = this.authClient.hasSession();
     const menu = new Menu();
-    if (!this.authClient.hasSession()) {
-      menu.addItem((i) => i.setTitle('Sign in').setIcon('log-in').onClick(() => void this.toggleAuth()));
-    } else {
+    menu.addItem((i) => i.setTitle(v.title).setIcon(v.icon.split('|')[0]).setDisabled(true));
+    if (v.action && v.action !== 'retry') {
+      menu.addItem((i) => i.setTitle(this.actionLabel(v.action)).setIcon('arrow-right').onClick(() => this.runAction(v.action)));
+    }
+    if (signedIn) {
+      menu.addSeparator();
       menu.addItem((i) =>
-        i.setTitle('Sync now').setIcon('refresh-cw').onClick(() => void this.syncEngine.syncNow()),
+        i.setTitle(t('action.syncNow')).setIcon('refresh-cw').onClick(() => void this.syncEngine.syncNow()),
       );
-      if (this.e2ee.unlocked) {
+      if (this.settings.vaultId) {
+        const file = this.app.workspace.getActiveFile();
         menu.addItem((i) =>
-          i.setTitle('Lock encryption').setIcon('lock').onClick(() => {
-            this.e2ee.lock();
-            this.setE2eeState('locked');
-            new Notice('Encryption locked.');
-          }),
-        );
-      } else {
-        menu.addItem((i) =>
-          i.setTitle('Set up / unlock encryption').setIcon('key').onClick(() => void this.promptEncryption()),
+          i
+            .setTitle(file ? t('action.openNoteWeb') : t('action.openWeb'))
+            .setIcon('globe')
+            .onClick(() => this.openInWeb(file?.path)),
         );
       }
-      menu.addSeparator();
-      menu.addItem((i) => i.setTitle('Settings').setIcon('settings').onClick(() => this.openSettings()));
-      menu.addItem((i) => i.setTitle('Sign out').setIcon('log-out').onClick(() => void this.toggleAuth()));
+      menu.addItem((i) =>
+        i
+          .setTitle(this.settings.vaultId || this.settings.legacyRoot ? t('action.changeVault') : t('action.chooseVault'))
+          .setIcon('folder-sync')
+          .onClick(() => void this.promptVaultChoice(true)),
+      );
+    }
+    menu.addSeparator();
+    menu.addItem((i) =>
+      i.setTitle(t('action.showLog')).setIcon('scroll-text').onClick(() => new SyncLogModal(this.app, this.syncEngine.log).open()),
+    );
+    menu.addItem((i) => i.setTitle(t('action.settings')).setIcon('settings').onClick(() => this.openSettings()));
+    if (signedIn) {
+      if (this.e2ee.unlocked) {
+        menu.addItem((i) => i.setTitle(t('action.lock')).setIcon('lock').onClick(() => this.lockEncryption()));
+      }
+      menu.addItem((i) => i.setTitle(t('action.signOut')).setIcon('log-out').onClick(() => void this.toggleAuth()));
+    } else {
+      menu.addItem((i) => i.setTitle(t('action.signIn')).setIcon('log-in').onClick(() => void this.toggleAuth()));
     }
     menu.showAtMouseEvent(evt);
   }
@@ -357,12 +489,64 @@ export default class ObsidianCloudPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
+    // data.json is shared between devices (it lives in the synced vault);
+    // per-device state comes from this device's storage — see deviceState.ts.
+    const data = ((await this.loadData()) ?? null) as Record<string, unknown> | null;
+    const { merged, migrated } = mergeDeviceState(data, this.loadDeviceState());
     // Clone the defaults: arrays/objects from DEFAULT_SETTINGS must never be
     // shared (and later mutated) across loads.
-    this.settings = Object.assign({}, structuredClone(DEFAULT_SETTINGS), await this.loadData());
+    this.settings = Object.assign({}, structuredClone(DEFAULT_SETTINGS), merged);
+    // Installs from before vaults existed synced the shared root: keep doing
+    // that rather than suddenly stopping (they can switch in the settings).
+    const s = this.settings;
+    const upgraded = !s.vaultId && !s.legacyRoot && (s.initialSyncDone || s.trackedPaths.length > 0);
+    if (upgraded) s.legacyRoot = true;
+    if (migrated || upgraded) await this.saveSettings();
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const { shared, device } = splitDeviceState(this.settings as unknown as Record<string, unknown>);
+    this.saveDeviceState(device);
+    await this.saveData(shared);
+  }
+
+  /** Vault-scoped, device-local storage (Obsidian ≥ 1.8.7), with a
+   *  window.localStorage fallback keyed by the vault name. */
+  private deviceStorage(): { load(): unknown; save(v: string): void } {
+    const app = this.app as unknown as {
+      loadLocalStorage?: (key: string) => unknown;
+      saveLocalStorage?: (key: string, data: unknown) => void;
+    };
+    if (typeof app.loadLocalStorage === 'function' && typeof app.saveLocalStorage === 'function') {
+      return {
+        load: () => app.loadLocalStorage!(DEVICE_STATE_STORAGE_KEY),
+        save: (v) => app.saveLocalStorage!(DEVICE_STATE_STORAGE_KEY, v),
+      };
+    }
+    const key = `${DEVICE_STATE_STORAGE_KEY}:${this.app.vault.getName()}`;
+    return {
+      load: () => window.localStorage.getItem(key),
+      save: (v) => window.localStorage.setItem(key, v),
+    };
+  }
+
+  private loadDeviceState(): Record<string, unknown> | null {
+    try {
+      // Stored as a JSON string ourselves, so it round-trips whether or not
+      // the storage layer (de)serializes on its own.
+      let v = this.deviceStorage().load();
+      if (typeof v === 'string') v = JSON.parse(v);
+      return v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private saveDeviceState(state: Record<string, unknown>): void {
+    try {
+      this.deviceStorage().save(JSON.stringify(state));
+    } catch (err) {
+      console.error('Obsidian-Cloud: could not persist device state', err);
+    }
   }
 }

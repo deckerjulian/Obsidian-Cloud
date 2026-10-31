@@ -3,7 +3,8 @@ import type ObsidianCloudPlugin from '../main';
 
 /**
  * Holds the short-lived access token in memory and persists ONLY the refresh
- * token to plugin data (there is no OS keychain on mobile). Mitigations: short
+ * token — in this device's vault-scoped storage, not in the (synced) data.json,
+ * see deviceState.ts (there is no OS keychain on mobile). Mitigations: short
  * access TTL, refresh rotation + reuse detection server-side, and logout revoke.
  */
 export class TokenStore {

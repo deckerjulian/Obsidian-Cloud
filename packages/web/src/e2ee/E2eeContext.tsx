@@ -78,6 +78,7 @@ export function E2eeProvider({ children }: { children: ReactNode }) {
   const privateKey = useRef<CryptoKey | null>(null);
   const publicKey = useRef<CryptoKey | null>(null);
   const keyCache = useRef<Map<string, CryptoKey>>(new Map());
+  const bulkKeys = useRef<Promise<Map<string, string>> | null>(null);
   const owner = useRef<string | null>(null); // userId whose keys are loaded
 
   const userId = user?.id ?? null;
@@ -148,7 +149,9 @@ export function E2eeProvider({ children }: { children: ReactNode }) {
         const adminKeys = await Promise.all(
           admins.map(async (a) => ({ userId: a.userId, key: await e2.importPublicKey(a.publicKey) })),
         );
-        const myDocs = await api.myDocumentKeys();
+        // Only the gaps (older servers: every doc).
+        const gaps = await api.adminKeyGaps().then((g) => new Set(g.docIds)).catch(() => null);
+        const myDocs = (await api.myDocumentKeys()).filter((k) => !gaps || gaps.has(k.docId));
         for (const { docId, wrappedKey } of myDocs) {
           if (!active) return;
           let contentKey: CryptoKey;
@@ -231,7 +234,25 @@ export function E2eeProvider({ children }: { children: ReactNode }) {
       const cached = keyCache.current.get(docId);
       if (cached) return cached;
       try {
-        const { wrappedKey } = await api.documentKey(docId);
+        // Opening a vault decrypts hundreds of names at once: fetch every
+        // wrapped key in ONE request (shared across concurrent callers)
+        // instead of one request per node, which trips the rate limit.
+        if (!bulkKeys.current) {
+          bulkKeys.current = api
+            .myDocumentKeys()
+            .then((list) => new Map(list.map((k) => [k.docId, k.wrappedKey])))
+            .catch(() => new Map<string, string>());
+          // Keys shared later must be re-fetched eventually.
+          setTimeout(() => (bulkKeys.current = null), 30_000);
+        }
+        const bulk = await bulkKeys.current;
+        let wrappedKey = bulk.get(docId);
+        if (!wrappedKey) {
+          // Not in the bulk list: either no key (most nodes an admin can see)
+          // or shared after the list was fetched — only then ask individually.
+          if (bulk.size > 0) return null;
+          wrappedKey = (await api.documentKey(docId)).wrappedKey;
+        }
         const key = await e2.unwrapContentKey(wrappedKey, privateKey.current);
         keyCache.current.set(docId, key);
         return key;

@@ -12,6 +12,7 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
   const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isPluginAdmin, setIsPluginAdmin] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -19,7 +20,7 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
     setBusy(true);
     setError(null);
     try {
-      await api.create({ email: email.trim(), displayName: displayName.trim(), password, isAdmin });
+      await api.create({ email: email.trim(), displayName: displayName.trim(), password, isAdmin, isPluginAdmin });
       onCreated();
     } catch (e) {
       setError((e as Error).message);
@@ -64,6 +65,10 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
       <label style={{ display: 'flex', gap: 8, alignItems: 'center', cursor: 'pointer' }}>
         <input type="checkbox" checked={isAdmin} onChange={(e) => setIsAdmin(e.target.checked)} />
         Administrator
+      </label>
+      <label style={{ display: 'flex', gap: 8, alignItems: 'center', cursor: 'pointer' }}>
+        <input type="checkbox" checked={isPluginAdmin} onChange={(e) => setIsPluginAdmin(e.target.checked)} />
+        Plugin admin (may change vaults' Obsidian plugins and settings in the cloud)
       </label>
     </Modal>
   );
@@ -121,6 +126,8 @@ export function AdminUsers() {
       </div>
       <p className="oc-faint" style={{ marginTop: 4 }}>
         Local users sign in with a password; directory (LDAP) users are provisioned on first login.
+        “Plugins in the cloud”: who may change a vault’s Obsidian plugins, their settings and themes on the
+        server (admins always; others only as plugin admin). Everyone else uses the plugins as set up.
       </p>
       {error && <div className="oc-error">{error}</div>}
 
@@ -131,6 +138,9 @@ export function AdminUsers() {
             <th>Email</th>
             <th>Source</th>
             <th>Role</th>
+            <th title="May change vaults' Obsidian plugins, their settings and themes in the cloud (the vault's .obsidian folder). Admins always can.">
+              Plugins in the cloud
+            </th>
             <th style={{ textAlign: 'right' }}>Actions</th>
           </tr>
         </thead>
@@ -151,6 +161,28 @@ export function AdminUsers() {
                 ) : (
                   <span className="oc-badge">user</span>
                 )}
+              </td>
+              <td>
+                <label
+                  className="oc-plugin-admin-toggle"
+                  title={
+                    u.isAdmin
+                      ? 'Admins can always manage plugins.'
+                      : u.isPluginAdmin
+                        ? 'Plugin admin — click to revoke.'
+                        : 'Make this user a plugin admin.'
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={u.isAdmin || u.isPluginAdmin}
+                    disabled={u.isAdmin}
+                    onChange={() => void act(() => api.update(u.id, { isPluginAdmin: !u.isPluginAdmin }))}
+                  />
+                  <span className={u.isAdmin ? 'oc-faint' : ''}>
+                    {u.isAdmin ? 'always (admin)' : u.isPluginAdmin ? 'plugin admin' : 'no'}
+                  </span>
+                </label>
               </td>
               <td>
                 <div className="oc-row-actions">

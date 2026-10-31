@@ -55,3 +55,6 @@ Thumbs.db
 
 # ── Miscellaneous ─────────────────────────────────────────────────────────────
 .claude/
+
+# Real community-plugin builds for the shim tests (third-party code, not ours)
+packages/web/src/obsidian/__tests__/plugin-fixtures/

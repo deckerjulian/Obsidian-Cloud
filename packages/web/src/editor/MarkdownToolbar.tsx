@@ -10,7 +10,8 @@ export function MarkdownToolbar({
 }: {
   view: EditorView | null;
   mode: 'edit' | 'preview';
-  onToggleMode: () => void;
+  /** Omit to hide the edit/preview toggle (the pane header owns it). */
+  onToggleMode?: () => void;
   disabled: boolean;
 }) {
   const editDisabled = disabled || mode !== 'edit' || !view;
@@ -58,10 +59,12 @@ export function MarkdownToolbar({
       <IconBtn icon="link" title="Link" onClick={run((v) => insertBlock(v, '[text](https://)'))} />
       <IconBtn icon="table" title="Table" onClick={run((v) => insertBlock(v, TABLE))} />
       <span className="oc-tb-spacer" />
+      {onToggleMode && (
       <button className="oc-tb-btn oc-tb-text" title={mode === 'edit' ? 'Preview' : 'Edit'} onClick={onToggleMode}>
         <Icon name={mode === 'edit' ? 'eye' : 'pencil'} size={15} />
         <span style={{ marginLeft: 5 }}>{mode === 'edit' ? 'Preview' : 'Edit'}</span>
       </button>
+      )}
     </div>
   );
 }

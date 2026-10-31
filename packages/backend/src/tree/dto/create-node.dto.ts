@@ -26,6 +26,10 @@ export class CreateNodeDto implements CreateNodeRequest {
   mime?: string;
 
   @IsOptional()
-  @IsIn(['plugins'])
+  @IsIn(['config'])
   systemType?: SystemFolderType;
+
+  @IsOptional()
+  @IsBoolean()
+  isVault?: boolean;
 }

@@ -2,9 +2,14 @@ import type { NodeKind } from '../constants';
 import type { Role } from '../roles';
 import type { Capability } from '../capabilities';
 
-/** Marks a folder with server-side special semantics. 'plugins': the central
- *  Obsidian plugin folder — synced to `.obsidian/plugins`, not into the vault. */
-export type SystemFolderType = 'plugins';
+/** Marks a folder with server-side special semantics. 'config': a vault's
+ *  Obsidian config folder (`.obsidian`: community plugins, their settings,
+ *  themes, snippets). Its code runs in the browser of everyone who opens the
+ *  vault, so only admins and plugin admins may change anything inside it. */
+export type SystemFolderType = 'config';
+
+/** Plaintext name of a vault's config folder (on the server, encrypted). */
+export const CONFIG_FOLDER_NAME = '.obsidian';
 
 /** A single node in the vault tree, as returned to a client. */
 export interface TreeNodeDto {
@@ -23,6 +28,8 @@ export interface TreeNodeDto {
   depth: number;
   /** Non-null for system folders (see SystemFolderType). */
   systemType: SystemFolderType | null;
+  /** A vault root: a top-level folder holding one Obsidian vault. */
+  isVault: boolean;
   /** The requesting user's effective role on this node (inherited, for display). */
   role: Role;
   /** The requesting user's effective fine-grained capabilities on this node. */
@@ -43,8 +50,12 @@ export interface CreateNodeRequest {
   /** For files: whether it is a collaborative text note (default true). */
   isText?: boolean;
   mime?: string;
-  /** Create a system folder (admin only; one per type; folder at the root). */
+  /** Create a system folder: 'config' = the vault's `.obsidian` folder
+   *  (admins / plugin admins only; a direct child of a vault, one per vault). */
   systemType?: SystemFolderType;
+  /** Create a vault (a folder at the root, parentId null). Any signed-in user
+   *  may create one and becomes its owner. */
+  isVault?: boolean;
 }
 
 /** `PATCH /api/nodes/:id` — rename and/or move. */
@@ -53,4 +64,7 @@ export interface UpdateNodeRequest {
   name?: string;
   /** New parent id (move). `null` moves to the vault root. */
   parentId?: string | null;
+  /** Mark an existing folder as the vault's config folder (admins / plugin
+   *  admins; folders created before the flag existed). */
+  systemType?: SystemFolderType;
 }

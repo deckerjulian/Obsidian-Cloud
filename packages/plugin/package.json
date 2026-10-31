@@ -1,6 +1,6 @@
 {
   "name": "@oc/plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "description": "Obsidian-Cloud plugin: multi-user sync with permissions and real-time collaboration.",

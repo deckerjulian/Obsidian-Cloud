@@ -31,6 +31,16 @@ interface AclEntryRow {
   user?: { email: string; displayName: string } | null;
 }
 
+/**
+ * Inside a vault's config folder (`.obsidian`: community plugin code and
+ * settings, themes, snippets) only admins and plugin admins may change
+ * anything — that code runs in the browser of everyone opening the vault.
+ * Everyone else keeps at most 'read' there, whatever the vault grant says.
+ */
+export function restrictForConfig(caps: Capability[], inConfig: boolean, canManageConfig: boolean): Capability[] {
+  return inConfig && !canManageConfig ? caps.filter((c) => c === 'read') : caps;
+}
+
 /** A grant's capabilities: explicit if set, otherwise derived from its role. */
 function grantCapabilities(role: Role, capabilities: Capability[]): Capability[] {
   return capabilities.length ? capabilities : capabilitiesForRole(role);
@@ -83,7 +93,28 @@ export class AclService {
         rc.forEach((c) => caps.add(c));
       }
     }
-    return [...caps];
+    let result = [...caps];
+    if (result.some((c) => c !== 'read') && (await this.isInConfigFolder(path))) {
+      result = restrictForConfig(result, true, await this.canManageConfig(user));
+    }
+    return result.length ? result : null;
+  }
+
+  /** Admins and plugin admins may change vaults' config folders. */
+  async canManageConfig(user: Principal): Promise<boolean> {
+    if (user.isAdmin) return true;
+    const u = await this.prisma.user.findUnique({ where: { id: user.userId }, select: { isPluginAdmin: true } });
+    return !!u?.isPluginAdmin;
+  }
+
+  /** Whether `path` is a config folder or lies inside one. */
+  async isInConfigFolder(path: string): Promise<boolean> {
+    if (path === '') return false;
+    const hit = await this.prisma.node.findFirst({
+      where: { systemType: 'config', path: { in: ancestorPaths(path) } },
+      select: { id: true },
+    });
+    return hit !== null;
   }
 
   /**
@@ -103,40 +134,11 @@ export class AclService {
   }
 
   /**
-   * Whether `path` is the central plugin folder or lives inside it. That folder
-   * is auto-distributed to everyone, so it is readable by all users regardless
-   * of explicit ACL.
-   */
-  async isInPluginsSubtree(path: string): Promise<boolean> {
-    if (path === '') return false;
-    const root = await this.prisma.node.findFirst({
-      where: { systemType: 'plugins', path: { in: ancestorPaths(path) } },
-      select: { id: true },
-    });
-    return root !== null;
-  }
-
-  /** Require `read` at `path`, but treat the plugin subtree as readable by every
-   *  authenticated user (it is distributed to all). */
-  async requireReadable(user: Principal, path: string): Promise<void> {
-    if (user.isAdmin) return;
-    const caps = await this.effectiveCapabilities(user, path);
-    if (caps && hasCapability(caps, 'read')) return;
-    if (await this.isInPluginsSubtree(path)) return;
-    throw new ForbiddenException(`Requires 'read' permission on '${path || '/'}'`);
-  }
-
-  /**
-   * User ids that may read at `path`: for the plugin subtree that is EVERY user
-   * (it is auto-distributed). Otherwise everyone with an explicit `read` grant
+   * User ids that may read at `path`: everyone with an explicit `read` grant
    * on the node or an ancestor, plus every admin (admins read all files). Used
    * to fan out a node's content key to everyone entitled to it.
    */
   async effectiveReaders(path: string): Promise<string[]> {
-    if (await this.isInPluginsSubtree(path)) {
-      const all = await this.prisma.user.findMany({ select: { id: true } });
-      return all.map((u) => u.id);
-    }
     const readers = new Set<string>();
     // Admins can read everything.
     const admins = await this.prisma.user.findMany({

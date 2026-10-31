@@ -63,6 +63,7 @@ export const e2eeApi = (f: AuthFetch) => ({
   publicKeys: () => f<PublicKeyDto[]>('/e2ee/public-keys'),
   grantees: (docId: string) => f<GranteeKeyDto[]>(`/e2ee/grantees/${docId}`),
   adminKeys: () => f<GranteeKeyDto[]>('/e2ee/admin-keys'),
+  adminKeyGaps: () => f<{ docIds: string[] }>('/e2ee/admin-key-gaps'),
   myDocumentKeys: () => f<DocumentKeyDto[]>('/e2ee/document-keys'),
   documentKey: (docId: string) => f<DocumentKeyDto>(`/e2ee/document-keys/${docId}`),
   setDocumentKeys: (docId: string, body: SetDocumentKeysRequest) =>

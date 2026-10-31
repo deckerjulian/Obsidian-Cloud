@@ -21,6 +21,7 @@ const USER: User = {
   passwordHash: 'x',
   externalId: null,
   isAdmin: true,
+  isPluginAdmin: false,
   createdAt: new Date(),
 };
 

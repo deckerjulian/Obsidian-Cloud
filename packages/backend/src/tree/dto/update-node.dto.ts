@@ -1,5 +1,5 @@
-import { IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
-import type { UpdateNodeRequest } from '@oc/shared';
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+import type { SystemFolderType, UpdateNodeRequest } from '@oc/shared';
 
 export class UpdateNodeDto implements UpdateNodeRequest {
   // Ciphertext, not plaintext — see CreateNodeDto.name.
@@ -13,4 +13,9 @@ export class UpdateNodeDto implements UpdateNodeRequest {
   @IsOptional()
   @IsUUID()
   parentId?: string | null;
+
+  // Mark an existing folder as the vault's config folder.
+  @IsOptional()
+  @IsIn(['config'])
+  systemType?: SystemFolderType;
 }

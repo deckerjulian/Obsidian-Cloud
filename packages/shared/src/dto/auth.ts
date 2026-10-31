@@ -27,6 +27,8 @@ export interface UserDto {
   email: string;
   displayName: string;
   isAdmin: boolean;
+  /** May change vaults' Obsidian config (community plugins) in the cloud. */
+  isPluginAdmin: boolean;
   authSource: AuthSource;
 }
 
@@ -45,12 +47,14 @@ export interface CreateUserRequest {
   displayName: string;
   password: string;
   isAdmin?: boolean;
+  isPluginAdmin?: boolean;
 }
 
 /** Admin: update a user (any subset). `password` resets a local password. */
 export interface UpdateUserRequest {
   displayName?: string;
   isAdmin?: boolean;
+  isPluginAdmin?: boolean;
   password?: string;
 }
 

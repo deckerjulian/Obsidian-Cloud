@@ -17,6 +17,7 @@ export function toUserDto(user: User): UserDto {
     email: user.email,
     displayName: user.displayName,
     isAdmin: user.isAdmin,
+    isPluginAdmin: user.isPluginAdmin,
     authSource: user.authSource,
   };
 }
@@ -53,6 +54,7 @@ export class UsersService {
         authSource: 'local',
         passwordHash: await hashPassword(input.password),
         isAdmin: input.isAdmin ?? false,
+        isPluginAdmin: input.isPluginAdmin ?? false,
       },
     });
   }
@@ -60,7 +62,8 @@ export class UsersService {
   /** Admin: update a user. A `password` resets a local account's password. */
   async update(id: string, dto: UpdateUserRequest): Promise<User> {
     const user = await this.getById(id);
-    const data: { displayName?: string; isAdmin?: boolean; passwordHash?: string } = {};
+    const data: { displayName?: string; isAdmin?: boolean; isPluginAdmin?: boolean; passwordHash?: string } = {};
+    if (dto.isPluginAdmin !== undefined) data.isPluginAdmin = dto.isPluginAdmin;
     if (dto.displayName !== undefined) data.displayName = dto.displayName;
     if (dto.isAdmin !== undefined) {
       // An instance without any admin is unrecoverable from the UI.

@@ -12,6 +12,10 @@ export class UpdateUserDto implements UpdateUserRequest {
   isAdmin?: boolean;
 
   @IsOptional()
+  @IsBoolean()
+  isPluginAdmin?: boolean;
+
+  @IsOptional()
   @IsString()
   @MinLength(8)
   password?: string;

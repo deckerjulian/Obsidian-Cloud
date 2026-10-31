@@ -40,3 +40,34 @@ export interface BlobContentDto {
   size: number;
   contentBase64: string;
 }
+
+/** `POST /api/documents/updates` — fetch the encrypted Yjs update logs of
+ *  several documents at once (for vault-wide indexing: search, links, plugins).
+ *  The server returns only ciphertext; unreadable/unknown ids are omitted. */
+export interface BatchUpdatesRequest {
+  docIds: string[];
+}
+
+export interface DocUpdatesDto {
+  docId: string;
+  /** Encrypted Yjs updates (base64), in log order. */
+  updates: string[];
+  /** When the newest stored update was written (ISO) — the content mtime. */
+  updatedAt: string | null;
+}
+
+export interface BatchUpdatesResponse {
+  docs: DocUpdatesDto[];
+}
+
+/** `POST /api/documents/:docId/updates` — append one encrypted Yjs update
+ *  (same envelope the realtime relay stores). Requires 'edit'. */
+export interface AppendUpdateRequest {
+  dataBase64: string;
+  /** Optional original modification time (ISO, not in the future) — lets an
+   *  importer keep the files' real mtimes instead of "imported just now". */
+  mtime?: string;
+}
+
+/** Max docIds per batch request. */
+export const MAX_BATCH_UPDATES = 200;

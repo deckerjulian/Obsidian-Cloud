@@ -796,3 +796,15 @@ button {
   font-size: 16px;
   margin: 0 0 4px;
 }
+
+/* Admin → Users: plugin admin toggle */
+.oc-plugin-admin-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.oc-plugin-admin-toggle input:disabled {
+  cursor: default;
+}

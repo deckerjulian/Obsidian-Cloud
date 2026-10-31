@@ -15,5 +15,6 @@ import { RealtimeService } from './realtime.service';
     }),
   ],
   providers: [RealtimeService],
+  exports: [RealtimeService],
 })
 export class RealtimeModule {}

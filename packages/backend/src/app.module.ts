@@ -18,8 +18,10 @@ import { E2eeModule } from './e2ee/e2ee.module';
       isGlobal: true,
       load: [configuration],
     }),
-    // Global rate limit: 120 requests/minute per IP (auth routes are stricter).
-    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
+    // Global rate limit: 600 requests/minute per IP (auth routes are stricter).
+    // Generous for authenticated API traffic (a note with many attachments, a
+    // vault import); login has its own strict limit (auth.controller).
+    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 600 }]),
     PrismaModule,
     UsersModule,
     AuthModule,

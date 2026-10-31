@@ -1,8 +1,14 @@
-import { App, Modal, Setting } from 'obsidian';
+import { App, Modal } from 'obsidian';
 import type ObsidianCloudPlugin from '../main';
+import { t } from '../i18n';
+import { button, icon, modalHeader, SyncLogModal } from '../ui/components';
 
-/** One-time prompt on first sign-in: offer to synchronize and show a report. */
+/** The first sync of a vault: explain what happens, run it with live progress,
+ *  then show what was transferred. */
 export class InitialSyncModal extends Modal {
+  private running = false;
+  private unsub: (() => void) | null = null;
+
   constructor(
     app: App,
     private readonly plugin: ObsidianCloudPlugin,
@@ -11,71 +17,92 @@ export class InitialSyncModal extends Modal {
   }
 
   onOpen(): void {
+    const s = this.plugin.settings;
+    modalHeader(this, 'cloud-upload|upload-cloud|upload', t('initial.title'));
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h3', { text: 'Synchronize your vault?' });
+    contentEl.createEl('p', { cls: 'oc-lead', text: t('initial.intro', { email: s.accountEmail ?? '—' }) });
     contentEl.createEl('p', {
-      text:
-        `You're signed in as ${this.plugin.settings.accountEmail ?? 'your account'}. ` +
-        'Download the folders and notes you have access to into this vault, upload your ' +
-        'local notes, and keep everything in sync?',
+      text: s.vaultName ? t('initial.vault', { vault: s.vaultName }) : t('initial.root'),
     });
-    new Setting(contentEl)
-      .addButton((b) =>
-        b.setButtonText('Not now').onClick(() => {
-          void this.markDone();
-          this.close();
-        }),
-      )
-      .addButton((b) =>
-        b
-          .setButtonText('Synchronize')
-          .setCta()
-          .onClick(() => void this.runSync()),
-      );
+    const ul = contentEl.createEl('ul', { cls: 'oc-list' });
+    for (const [ic, key] of [
+      ['download', 'initial.point.down'],
+      ['upload', 'initial.point.up'],
+      ['shield-check|shield', 'initial.point.safe'],
+    ] as const) {
+      const li = ul.createEl('li');
+      icon(li, ic);
+      li.createSpan({ text: t(key) });
+    }
+    const buttons = contentEl.createDiv({ cls: 'oc-buttons' });
+    button(buttons, t('action.notNow'), {
+      onClick: () => {
+        this.plugin.refreshSettingsTab();
+        this.close();
+      },
+    });
+    const start = button(buttons, t('action.startSync'), { cta: true, onClick: () => void this.runSync() });
+    window.setTimeout(() => start.focus(), 0);
   }
 
   private async runSync(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h3', { text: 'Synchronizing…' });
-    contentEl.createEl('p', { text: 'Reconciling your vault with the server.' });
+    modalHeader(this, 'refresh-cw', t('initial.running'));
+    const progress = contentEl.createDiv({ cls: 'oc-progress' });
+    icon(progress, 'loader-2|loader|refresh-cw', 'oc-spin');
+    const col = progress.createDiv();
+    col.style.minWidth = '0';
+    col.createDiv({ text: t('initial.running.detail') });
+    const line = col.createDiv({ cls: 'oc-progress-line' });
+    // Mirror the latest log line as live progress.
+    this.unsub = this.plugin.syncEngine.log.onChange(() => {
+      const last = this.plugin.syncEngine.log.all().pop();
+      if (last) line.setText(last.message);
+    });
 
     const report = await this.plugin.syncEngine.start();
-    await this.markDone();
+    this.unsub?.();
+    this.unsub = null;
+    this.running = false;
+    this.plugin.refreshSettingsTab();
 
     contentEl.empty();
     if (!report) {
-      contentEl.createEl('h3', { text: 'Sync failed' });
-      contentEl.createEl('p', { text: 'See the sync log under Settings → Obsidian Cloud.' });
+      modalHeader(this, 'triangle-alert|alert-triangle', t('initial.failed'));
+      contentEl.createEl('p', { cls: 'oc-lead', text: t('initial.failed.detail') });
     } else {
-      contentEl.createEl('h3', {
-        text: report.errors.length ? 'Sync finished with warnings' : 'Sync complete',
-      });
-      const ul = contentEl.createEl('ul');
-      ul.createEl('li', { text: `${report.foldersCreated} folders created` });
-      ul.createEl('li', { text: `${report.filesCreated} notes created` });
-      if (report.pushed) ul.createEl('li', { text: `${report.pushed} local files uploaded` });
-      if (report.removed) ul.createEl('li', { text: `${report.removed} removed` });
-      if (report.errors.length) {
-        ul.createEl('li', { text: `${report.errors.length} errors — see the sync log in settings` });
-      }
+      const problems = report.errors.length;
+      modalHeader(this, problems ? 'triangle-alert|alert-triangle' : 'circle-check|check-circle', problems ? t('initial.warnings') : t('initial.done'));
+      const stats = contentEl.createDiv({ cls: 'oc-stats' });
+      const stat = (n: number, label: string, cls = ''): void => {
+        const el = stats.createDiv({ cls: `oc-stat ${cls}` });
+        el.createDiv({ cls: 'oc-stat-n', text: String(n) });
+        el.createDiv({ cls: 'oc-stat-l', text: label });
+      };
+      stat(report.filesCreated, t('initial.stat.notes'));
+      stat(report.foldersCreated, t('initial.stat.folders'));
+      stat(report.pushed, t('initial.stat.uploaded'));
+      if (problems) stat(problems, t('initial.stat.errors'), 'is-error');
     }
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText('Done')
-        .setCta()
-        .onClick(() => this.close()),
-    );
-  }
-
-  private async markDone(): Promise<void> {
-    this.plugin.settings.initialSyncDone = true;
-    await this.plugin.saveSettings();
-    this.plugin.refreshSettingsTab();
+    const buttons = contentEl.createDiv({ cls: 'oc-buttons' });
+    if (!report || report.errors.length) {
+      button(buttons, t('action.showLog'), {
+        onClick: () => {
+          this.close();
+          new SyncLogModal(this.app, this.plugin.syncEngine.log).open();
+        },
+      });
+    }
+    const done = button(buttons, t('action.done'), { cta: true, onClick: () => this.close() });
+    done.focus();
   }
 
   onClose(): void {
+    this.unsub?.();
     this.contentEl.empty();
   }
 }

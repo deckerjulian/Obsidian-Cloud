@@ -7,9 +7,17 @@ interface Grant {
   role: Role;
 }
 
-/** Mocks prisma.aclEntry.findMany, honouring the ancestor `path IN (...)` filter. */
-function makeService(grants: Grant[]) {
+/** Mocks prisma.aclEntry.findMany, honouring the ancestor `path IN (...)` filter.
+ *  `configPaths`: folders flagged as a vault config folder (`.obsidian`). */
+function makeService(grants: Grant[], configPaths: string[] = [], pluginAdmins: string[] = []) {
   const prisma = {
+    node: {
+      findFirst: async ({ where }: { where: { path: { in: string[] } } }) =>
+        configPaths.find((p) => where.path.in.includes(p)) ? { id: 'cfg' } : null,
+    },
+    user: {
+      findUnique: async ({ where }: { where: { id: string } }) => ({ isPluginAdmin: pluginAdmins.includes(where.id) }),
+    },
     aclEntry: {
       findMany: async ({ where }: { where: { node: { path: { in: string[] } } } }) => {
         const paths = where.node.path.in;
@@ -51,5 +59,23 @@ describe('AclService.effectiveRole', () => {
       { path: 'a', depth: 1, role: 'owner' },
     ]);
     expect(await svc.effectiveRole(user, 'a/b')).toBe('owner');
+  });
+});
+
+describe('AclService: vault config folder', () => {
+  const grants: Grant[] = [{ path: 'v', depth: 1, role: 'owner' }];
+
+  it('leaves only read inside the config folder for regular users', async () => {
+    const svc = makeService(grants, ['v/cfg']);
+    expect(await svc.effectiveCapabilities({ userId: 'u1', isAdmin: false }, 'v/cfg/plugin/main')).toEqual(['read']);
+    expect(await svc.effectiveCapabilities({ userId: 'u1', isAdmin: false }, 'v/cfg')).toEqual(['read']);
+    // Outside the config folder the vault grant applies unchanged.
+    expect(await svc.effectiveCapabilities({ userId: 'u1', isAdmin: false }, 'v/notes')).toContain('edit');
+  });
+
+  it('keeps the grant for plugin admins and admins', async () => {
+    const svc = makeService(grants, ['v/cfg'], ['pa']);
+    expect(await svc.effectiveCapabilities({ userId: 'pa', isAdmin: false }, 'v/cfg/x')).toContain('edit');
+    expect(await svc.effectiveCapabilities({ userId: 'adm', isAdmin: true }, 'v/cfg/x')).toContain('edit');
   });
 });

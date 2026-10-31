@@ -1,15 +1,18 @@
-import { App, Modal, Notice, Setting, type ButtonComponent } from 'obsidian';
+import { App, Modal, Notice } from 'obsidian';
 import type ObsidianCloudPlugin from '../main';
 import { checkServerHealth } from '../api/health';
+import { t } from '../i18n';
+import { button, errorBox, field, icon, modalHeader, withBusy } from '../ui/components';
 
-/** Collects credentials and signs in via the backend. Signing in is only
- *  enabled once the configured server URL answers the health endpoint. */
+/**
+ * Sign-in dialog. The server address can be fixed right here (no detour via
+ * the settings); it is health-checked as you type, and Sign in only goes
+ * through once the server answers.
+ */
 export class LoginModal extends Modal {
-  private username = '';
-  private password = '';
   private serverOk = false;
-  private signInBtn: ButtonComponent | null = null;
-  private statusEl: HTMLElement | null = null;
+  private checkSeq = 0;
+  private checkTimer: number | null = null;
 
   constructor(
     app: App,
@@ -20,87 +23,97 @@ export class LoginModal extends Modal {
   }
 
   onOpen(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h3', { text: 'Sign in to Obsidian Cloud' });
-    contentEl.createEl('p', {
-      text: this.plugin.settings.serverUrl,
-      cls: 'mod-muted',
+    modalHeader(this, 'cloud', t('login.title'));
+    const form = this.contentEl.createDiv({ cls: 'oc-form' });
+
+    const url = field(form, t('login.server'), {
+      type: 'url',
+      value: this.plugin.settings.serverUrl,
+      placeholder: 'https://cloud.example.com',
     });
-    this.statusEl = contentEl.createEl('p');
-    this.statusEl.style.fontSize = '13px';
+    const status = form.createDiv({ cls: 'oc-inline-status' });
+    status.style.marginTop = '-8px';
+    const email = field(form, t('login.email'), { type: 'email', autocomplete: 'username' });
+    if (this.plugin.settings.accountEmail) email.value = this.plugin.settings.accountEmail;
+    const password = field(form, t('login.password'), { secret: true, autocomplete: 'current-password' });
+    const error = errorBox(form);
 
-    new Setting(contentEl).setName('Username').addText((t) =>
-      t.setPlaceholder('email or directory username').onChange((v) => (this.username = v.trim())),
-    );
+    const buttons = this.contentEl.createDiv({ cls: 'oc-buttons' });
+    button(buttons, t('action.cancel'), { onClick: () => this.close() });
+    const submit = button(buttons, t('login.submit'), { cta: true, onClick: () => void doSubmit() });
 
-    new Setting(contentEl).setName('Password').addText((t) => {
-      t.inputEl.type = 'password';
-      t.onChange((v) => (this.password = v));
-      t.inputEl.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') void this.submit();
-      });
+    const setStatus = (tone: 'busy' | 'ok' | 'error' | 'off', text: string, iconName: string): void => {
+      status.className = `oc-inline-status oc-tone-${tone}`;
+      status.empty();
+      icon(status, iconName, tone === 'busy' ? 'oc-spin' : '');
+      status.createSpan({ text });
+    };
+    const check = async (): Promise<void> => {
+      const value = url.value.trim().replace(/\/+$/, '');
+      const seq = ++this.checkSeq;
+      this.serverOk = false;
+      if (!value) {
+        setStatus('off', t('settings.server.empty'), 'info');
+        return;
+      }
+      setStatus('busy', t('settings.server.checking'), 'loader-2|loader');
+      const res = await checkServerHealth(value);
+      if (seq !== this.checkSeq) return; // a newer check is running
+      this.serverOk = res.ok;
+      if (res.ok) {
+        setStatus('ok', t('settings.server.ok'), 'check');
+        if (this.plugin.settings.serverUrl !== value) {
+          this.plugin.settings.serverUrl = value;
+          await this.plugin.saveSettings();
+        }
+      } else setStatus('error', res.message, 'circle-alert|alert-circle');
+    };
+    url.addEventListener('input', () => {
+      if (this.checkTimer !== null) window.clearTimeout(this.checkTimer);
+      this.checkTimer = window.setTimeout(() => void check(), 500);
     });
 
-    new Setting(contentEl)
-      .addButton((b) =>
-        b.setButtonText('Check again').onClick(() => void this.verifyServer()),
-      )
-      .addButton((b) => {
-        this.signInBtn = b;
-        b.setButtonText('Sign in')
-          .setCta()
-          .setDisabled(true)
-          .onClick(() => void this.submit());
+    const doSubmit = async (): Promise<void> => {
+      error.set(null);
+      if (!email.value.trim() || !password.value) {
+        error.set(t('login.missing'));
+        (email.value.trim() ? password : email).focus();
+        return;
+      }
+      if (!this.serverOk) await check();
+      if (!this.serverOk) {
+        error.set(t('login.serverDown'));
+        url.focus();
+        return;
+      }
+      await withBusy(submit, t('login.busy'), async () => {
+        try {
+          const user = await this.plugin.authClient.login(email.value.trim(), password.value);
+          new Notice(t('login.done', { email: user.email }));
+          this.close();
+          this.onSuccess();
+        } catch (err) {
+          error.set(t('login.failed', { msg: (err as Error).message }));
+          password.select();
+        }
       });
+    };
+    for (const input of [url, email, password]) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        if (input === email && !password.value) password.focus();
+        else void doSubmit();
+      });
+    }
 
-    void this.verifyServer();
-  }
-
-  /** Health-check the configured server; the Sign in button stays disabled
-   *  until the backend actually answers. */
-  private async verifyServer(): Promise<void> {
-    this.serverOk = false;
-    this.signInBtn?.setDisabled(true);
-    if (this.statusEl) {
-      this.statusEl.setText('Checking server…');
-      this.statusEl.style.color = 'var(--text-muted)';
-    }
-    const res = await checkServerHealth(this.plugin.settings.serverUrl);
-    if (!this.statusEl) return; // modal closed meanwhile
-    if (res.ok) {
-      this.serverOk = true;
-      this.signInBtn?.setDisabled(false);
-      this.statusEl.setText('Server is reachable ✓');
-      this.statusEl.style.color = 'var(--text-success, #3fb950)';
-    } else {
-      this.statusEl.setText(`${res.message} Fix the server URL in the plugin settings.`);
-      this.statusEl.style.color = 'var(--text-error, #e5534b)';
-    }
-  }
-
-  private async submit(): Promise<void> {
-    if (!this.serverOk) {
-      new Notice('Server is not reachable — fix the server URL in the settings first.');
-      return;
-    }
-    if (!this.username || !this.password) {
-      new Notice('Enter a username and password.');
-      return;
-    }
-    try {
-      const user = await this.plugin.authClient.login(this.username, this.password);
-      new Notice(`Signed in as ${user.email}`);
-      this.close();
-      this.onSuccess();
-    } catch (err) {
-      new Notice(`Sign-in failed: ${(err as Error).message}`);
-    }
+    void check();
+    window.setTimeout(() => (this.plugin.settings.serverUrl ? (email.value ? password : email) : url).focus(), 0);
   }
 
   onClose(): void {
-    this.statusEl = null;
-    this.signInBtn = null;
+    if (this.checkTimer !== null) window.clearTimeout(this.checkTimer);
+    this.checkSeq++;
     this.contentEl.empty();
   }
 }

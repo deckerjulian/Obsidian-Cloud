@@ -1,7 +1,9 @@
-import { App, PluginSettingTab, Setting, type TextComponent } from 'obsidian';
+import { App, PluginSettingTab, Setting } from 'obsidian';
 import type ObsidianCloudPlugin from './main';
 import { checkServerHealth } from './api/health';
-import type { SyncLogEntry } from './sync/SyncLog';
+import { t } from './i18n';
+import { describeStatus, setupSteps } from './ui/status';
+import { button, icon, renderSyncLog, setIconSafe } from './ui/components';
 
 export interface ObsidianCloudSettings {
   /** Base URL of the backend, e.g. https://vault.example.com */
@@ -28,9 +30,16 @@ export interface ObsidianCloudSettings {
   /** Signature of the admin set last backfilled with this user's content keys
    *  (admins can read all files). Re-runs the backfill when it changes. */
   adminKeySignature: string | null;
-  /** Signature of the user set the (manager's) central plugin folder keys were
-   *  last distributed to. Re-keys the plugin subtree when users join/leave. */
-  pluginGranteeSignature: string | null;
+  /** The server vault (isVault folder node id) this local vault mirrors. */
+  vaultId: string | null;
+  /** Its decrypted name, cached for display. */
+  vaultName: string | null;
+  /** Explicitly sync the shared root instead of a vault (pre-vault servers and
+   *  existing installs). Without a vault or this flag, nothing syncs yet. */
+  legacyRoot: boolean;
+  /** Config push bookkeeping: config-relative path → `docId:mtime:size`
+   *  last uploaded from this device (skips unchanged files across restarts). */
+  configPushed: Record<string, string>;
 }
 
 export const DEFAULT_SETTINGS: ObsidianCloudSettings = {
@@ -45,20 +54,18 @@ export const DEFAULT_SETTINGS: ObsidianCloudSettings = {
   askOnConflict: true,
   ignoredPaths: [],
   adminKeySignature: null,
-  pluginGranteeSignature: null,
-};
-
-const LEVEL_COLOR: Record<SyncLogEntry['level'], string> = {
-  info: 'var(--text-muted)',
-  success: 'var(--text-success, #3fb950)',
-  error: 'var(--text-error, #e5534b)',
+  vaultId: null,
+  vaultName: null,
+  legacyRoot: false,
+  configPushed: {},
 };
 
 export class ObsidianCloudSettingTab extends PluginSettingTab {
   private isOpen = false;
-  private unsubLog: (() => void) | null = null;
-  private logEl: HTMLElement | null = null;
-  private urlStatusEl: HTMLElement | null = null;
+  private cleanups: Array<() => void> = [];
+  private cardEl: HTMLElement | null = null;
+  private serverOk = false;
+  private urlCheckSeq = 0;
   private urlCheckTimer: number | null = null;
 
   constructor(
@@ -70,182 +77,228 @@ export class ObsidianCloudSettingTab extends PluginSettingTab {
 
   display(): void {
     this.isOpen = true;
+    this.teardown();
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass('oc-settings');
+    const plugin = this.plugin;
+    const st = plugin.settings;
+    const signedIn = plugin.authClient.hasSession();
 
-    // ── Connection ──
-    new Setting(containerEl).setName('Connection').setHeading();
-    let urlText: TextComponent | null = null;
-    const urlSetting = new Setting(containerEl)
-      .setName('Server URL')
-      .setDesc('Base URL of your Obsidian-Cloud backend.')
-      .addText((text) => {
-        urlText = text;
-        text
-          .setPlaceholder('http://localhost:8080')
-          .setValue(this.plugin.settings.serverUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.serverUrl = value.trim().replace(/\/+$/, '');
-            await this.plugin.saveSettings();
-            // Re-check as you type, debounced, so the status stays current.
-            this.scheduleServerCheck(text);
-          });
-        // Also validate immediately when the field is left.
-        text.inputEl.addEventListener('blur', () => void this.checkServerUrl(text));
+    // ── status card (live) ──
+    this.cardEl = containerEl.createDiv();
+    this.renderCard();
+    this.cleanups.push(plugin.onStateChange(() => this.renderCard()));
+
+    // ── server & account ──
+    new Setting(containerEl).setName(t('settings.connection')).setHeading();
+    const url = new Setting(containerEl)
+      .setName(t('settings.serverUrl'))
+      .setDesc(signedIn ? t('settings.serverUrl.locked') : t('settings.serverUrl.desc'));
+    const urlStatus = url.descEl.createDiv({ cls: 'oc-inline-status' });
+    url.addText((text) => {
+      text.setPlaceholder('https://cloud.example.com').setValue(st.serverUrl);
+      text.inputEl.style.width = '260px';
+      // Changing servers while signed in would mix two servers' bookkeeping.
+      text.setDisabled(signedIn);
+      text.onChange(async (value) => {
+        st.serverUrl = value.trim().replace(/\/+$/, '');
+        await plugin.saveSettings();
+        if (this.urlCheckTimer !== null) window.clearTimeout(this.urlCheckTimer);
+        this.urlCheckTimer = window.setTimeout(() => void this.checkServer(urlStatus), 500);
       });
-    // Persistent status line under the field, refreshed each time the tab opens.
-    this.urlStatusEl = urlSetting.descEl.createDiv({ cls: 'oc-url-status' });
-    this.urlStatusEl.style.marginTop = '4px';
-    this.urlStatusEl.style.fontSize = '12px';
-    if (urlText) void this.checkServerUrl(urlText);
+      text.inputEl.addEventListener('blur', () => text.setValue(st.serverUrl));
+    });
+    void this.checkServer(urlStatus);
 
-    // ── Account ──
-    new Setting(containerEl).setName('Account').setHeading();
-    const signedIn = this.plugin.authClient.hasSession();
-    new Setting(containerEl)
-      .setName(signedIn ? `Signed in as ${this.plugin.settings.accountEmail ?? 'unknown'}` : 'Not signed in')
-      .setDesc(signedIn ? 'Your vault syncs with the server according to your permissions.' : 'Sign in to start syncing.')
-      .addButton((btn) =>
-        btn
-          .setButtonText(signedIn ? 'Sign out' : 'Sign in')
-          .setCta()
-          .onClick(() => void this.plugin.toggleAuth()),
-      );
+    const account = new Setting(containerEl)
+      .setName(signedIn ? t('settings.account.signedIn', { email: st.accountEmail ?? '—' }) : t('settings.account.signedOut'))
+      .setDesc(signedIn ? t('settings.account.signedIn.desc') : t('settings.account.signedOut.desc'));
+    account.addButton((b) => {
+      b.setButtonText(signedIn ? t('action.signOut') : t('action.signIn')).onClick(() => void plugin.toggleAuth());
+      if (!signedIn) b.setCta();
+    });
 
-    // ── Synchronization ──
-    new Setting(containerEl).setName('Synchronization').setHeading();
-    new Setting(containerEl)
-      .setName('Background sync interval')
-      .setDesc('How often the plugin checks the server for changes.')
-      .addSlider((s) =>
-        s
-          .setLimits(5, 120, 5)
-          .setValue(this.plugin.settings.syncIntervalSeconds)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.syncIntervalSeconds = value;
-            await this.plugin.saveSettings();
-            if (signedIn) this.plugin.syncEngine.startPolling();
-          }),
+    // ── vault ──
+    new Setting(containerEl).setName(t('settings.vault')).setHeading();
+    const vaultName = st.vaultId ? (st.vaultName ?? st.vaultId) : st.legacyRoot ? t('vault.legacy') : null;
+    const vault = new Setting(containerEl).setName(t('settings.vault.name')).setDesc(t('settings.vault.desc'));
+    vault.nameEl.createSpan({
+      cls: `oc-badge ${vaultName ? 'oc-tone-ok' : 'oc-tone-warn'}`,
+      text: vaultName ?? t('settings.vault.none'),
+    });
+    if (st.vaultId) {
+      vault.addExtraButton((b) =>
+        b
+          .setIcon('globe')
+          .setTooltip(t('action.openWeb'))
+          .onClick(() => plugin.openInWeb()),
       );
-    new Setting(containerEl)
-      .setName('Sync now')
-      .setDesc('Run a full reconciliation immediately.')
-      .addButton((btn) =>
-        btn.setButtonText('Sync now').onClick(() => void this.plugin.syncEngine.syncNow()),
-      );
-    new Setting(containerEl)
-      .setName('Ask how to handle sync problems')
-      .setDesc(
-        'Show a popup when a file conflicts or cannot be synchronized. ' +
-          'When off, conflicts keep both versions and failures are only logged.',
-      )
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.askOnConflict).onChange(async (value) => {
-          this.plugin.settings.askOnConflict = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-    if (this.plugin.settings.ignoredPaths.length > 0) {
-      new Setting(containerEl)
-        .setName('Excluded from sync')
-        .setDesc(
-          `${this.plugin.settings.ignoredPaths.length} path(s) marked "never sync": ` +
-            this.plugin.settings.ignoredPaths.join(', '),
-        )
-        .addButton((btn) =>
-          btn.setButtonText('Sync them again').onClick(async () => {
-            this.plugin.settings.ignoredPaths = [];
-            await this.plugin.saveSettings();
-            this.display();
-          }),
-        );
     }
+    vault.addButton((b) =>
+      b
+        .setButtonText(vaultName ? t('action.changeVault') : t('action.chooseVault'))
+        .setDisabled(!signedIn)
+        .onClick(() => void plugin.promptVaultChoice(true)),
+    );
 
-    // ── Sync log ──
-    new Setting(containerEl)
-      .setName('Sync log')
-      .setHeading()
-      .addButton((btn) =>
-        btn.setButtonText('Clear').onClick(() => {
-          this.plugin.syncEngine.log.clear();
-        }),
-      );
-    this.logEl = containerEl.createDiv();
-    this.logEl.style.cssText =
-      'max-height:240px;overflow:auto;border:1px solid var(--background-modifier-border);border-radius:6px;padding:8px;font-family:var(--font-monospace);font-size:12px;line-height:1.5;background:var(--background-secondary);';
-    this.renderLog();
-
-    this.unsubLog?.();
-    this.unsubLog = this.plugin.syncEngine.log.onChange(() => this.renderLog());
-  }
-
-  /** Debounce reachability checks while the user is still typing the URL. */
-  private scheduleServerCheck(text: TextComponent): void {
-    if (this.urlCheckTimer !== null) window.clearTimeout(this.urlCheckTimer);
-    this.setUrlStatus('Checking server…', 'var(--text-muted)');
-    this.urlCheckTimer = window.setTimeout(() => {
-      this.urlCheckTimer = null;
-      void this.checkServerUrl(text, false);
-    }, 600);
-  }
-
-  /** Reachability check for the entered server URL; shows an inline status.
-   *  `normalize` reflects the trimmed value back into the field (skip while typing). */
-  private async checkServerUrl(text: TextComponent, normalize = true): Promise<void> {
-    const el = this.urlStatusEl;
-    if (!el) return;
-    const url = this.plugin.settings.serverUrl;
-    if (!url) {
-      this.setUrlStatus('Enter a server URL.', 'var(--text-muted)');
-      return;
-    }
-    if (normalize) text.setValue(url); // reflect the normalized value (trimmed, no trailing /)
-    this.setUrlStatus('Checking server…', 'var(--text-muted)');
-    const res = await checkServerHealth(url);
-    // The tab may have been re-rendered or closed while we awaited.
-    if (this.urlStatusEl !== el) return;
-    if (res.ok) {
-      this.setUrlStatus('Server is reachable ✓', 'var(--text-success, #3fb950)');
+    // ── encryption ──
+    new Setting(containerEl).setName(t('settings.encryption')).setHeading();
+    const e2ee = plugin.statusInput().e2ee;
+    const enc = new Setting(containerEl);
+    if (!signedIn) enc.setName(t('settings.encryption')).setDesc(t('settings.encryption.unknown'));
+    else if (e2ee === 'unlocked') {
+      enc.setName(t('settings.encryption.on')).setDesc(t('settings.encryption.on.desc'));
+      enc.addButton((b) => b.setButtonText(t('action.lock')).onClick(() => plugin.lockEncryption()));
+    } else if (e2ee === 'not-setup') {
+      enc.setName(t('settings.encryption.notSetup')).setDesc(t('settings.encryption.notSetup.desc'));
+      enc.addButton((b) => b.setButtonText(t('action.setUpEncryption')).setCta().onClick(() => void plugin.promptEncryption(true)));
     } else {
-      this.setUrlStatus(res.message, 'var(--text-error, #e5534b)');
+      enc.setName(t('settings.encryption.locked')).setDesc(t('settings.encryption.locked.desc'));
+      enc.addButton((b) => b.setButtonText(t('action.unlock')).setCta().onClick(() => void plugin.promptEncryption(true)));
     }
+    if (signedIn) {
+      const badge = enc.nameEl.createSpan({ cls: `oc-badge is-icon ${e2ee === 'unlocked' ? 'oc-tone-ok' : 'oc-tone-warn'}` });
+      setIconSafe(badge, e2ee === 'unlocked' ? 'shield-check|shield' : 'lock');
+    }
+
+    // ── synchronization ──
+    new Setting(containerEl).setName(t('settings.sync')).setHeading();
+    const interval = new Setting(containerEl)
+      .setName(t('settings.interval'))
+      .setDesc(t('settings.interval.desc', { s: st.syncIntervalSeconds }));
+    interval.addSlider((sl) =>
+      sl
+        .setLimits(5, 120, 5)
+        .setValue(st.syncIntervalSeconds)
+        .setDynamicTooltip()
+        .onChange(async (value) => {
+          st.syncIntervalSeconds = value;
+          interval.setDesc(t('settings.interval.desc', { s: value }));
+          await plugin.saveSettings();
+          if (plugin.authClient.hasSession()) plugin.syncEngine.startPolling();
+        }),
+    );
+    new Setting(containerEl)
+      .setName(t('settings.askConflicts'))
+      .setDesc(t('settings.askConflicts.desc'))
+      .addToggle((tg) =>
+        tg.setValue(st.askOnConflict).onChange(async (value) => {
+          st.askOnConflict = value;
+          await plugin.saveSettings();
+        }),
+      );
+    if (st.ignoredPaths.length > 0) {
+      new Setting(containerEl).setName(t('settings.excluded')).setDesc(t('settings.excluded.desc'));
+      const box = containerEl.createDiv({ cls: 'oc-excluded' });
+      for (const path of st.ignoredPaths) {
+        const row = box.createDiv({ cls: 'oc-excluded-row' });
+        row.createSpan({ text: path });
+        const b = row.createEl('button', { cls: 'clickable-icon', attr: { 'aria-label': t('action.resume') } });
+        setIconSafe(b, 'rotate-ccw|undo');
+        b.addEventListener('click', async () => {
+          st.ignoredPaths = st.ignoredPaths.filter((p) => p !== path);
+          await plugin.saveSettings();
+          this.display();
+        });
+      }
+    }
+
+    // ── plugins & appearance (config push) ──
+    if (st.vaultId) {
+      new Setting(containerEl).setName(t('settings.config')).setHeading();
+      const state = plugin.syncEngine.configSync.state;
+      const cfg = new Setting(containerEl)
+        .setName(
+          state === 'denied' ? t('settings.config.state.denied') : state === 'ok' ? t('settings.config.state.ok') : t('settings.config.state.pending'),
+        )
+        .setDesc(
+          `${t('settings.config.desc')} ${
+            state === 'denied' ? t('settings.config.denied') : state === 'ok' ? t('settings.config.ok') : t('settings.config.waiting')
+          }`,
+        );
+      const ic = createSpan({ cls: `oc-badge is-icon is-leading ${state === 'denied' ? 'oc-tone-warn' : state === 'ok' ? 'oc-tone-ok' : 'oc-tone-off'}` });
+      setIconSafe(ic, state === 'denied' ? 'lock' : state === 'ok' ? 'check' : 'clock');
+      cfg.nameEl.prepend(ic);
+    }
+
+    // ── sync log ──
+    new Setting(containerEl).setName(t('settings.log')).setHeading();
+    this.cleanups.push(renderSyncLog(containerEl.createDiv(), plugin.syncEngine.log));
   }
 
-  private setUrlStatus(text: string, color: string): void {
-    if (!this.urlStatusEl) return;
-    this.urlStatusEl.setText(text);
-    this.urlStatusEl.style.color = color;
-  }
-
-  private renderLog(): void {
-    const el = this.logEl;
+  /** The status card: what's going on, the next step, the setup checklist. */
+  private renderCard(): void {
+    const el = this.cardEl;
     if (!el) return;
+    const input = this.plugin.statusInput();
+    const v = describeStatus(input);
     el.empty();
-    const entries = this.plugin.syncEngine.log.all().slice(-100).reverse();
-    if (entries.length === 0) {
-      el.createEl('div', { text: 'No sync activity yet.', cls: 'oc-log-empty' }).style.color =
-        'var(--text-faint)';
+    const card = el.createDiv({ cls: `oc-status-card oc-tone-${v.tone}` });
+    icon(card, v.icon, `oc-card-icon${v.tone === 'busy' ? ' oc-spin' : ''}`);
+    const body = card.createDiv({ cls: 'oc-card-body' });
+    body.createDiv({ cls: 'oc-card-title', text: v.title });
+    if (v.detail) body.createDiv({ cls: 'oc-card-detail', text: v.detail });
+    const meta = [input.signedIn ? this.plugin.settings.accountEmail : null, this.plugin.settings.serverUrl].filter(Boolean).join(' · ');
+    if (meta) body.createDiv({ cls: 'oc-card-meta', text: meta });
+
+    const steps = setupSteps(input, this.serverOk);
+    if (steps.some((s) => s.state !== 'done')) {
+      const row = body.createDiv({ cls: 'oc-steps' });
+      steps.forEach((s, i) => {
+        const step = row.createSpan({ cls: `oc-step is-${s.state}` });
+        const dot = step.createSpan({ cls: 'oc-step-dot' });
+        if (s.state === 'done') setIconSafe(dot, 'check');
+        else dot.setText(String(i + 1));
+        step.createSpan({ text: s.label });
+      });
+    }
+
+    const actions = body.createDiv({ cls: 'oc-card-actions' });
+    if (v.action) button(actions, this.plugin.actionLabel(v.action), { cta: true, onClick: () => this.plugin.runAction(v.action) });
+    if (v.tone === 'ok') {
+      button(actions, t('action.syncNow'), { onClick: () => void this.plugin.syncEngine.syncNow() });
+    }
+    if (!actions.hasChildNodes()) actions.remove();
+  }
+
+  private async checkServer(el: HTMLElement): Promise<void> {
+    const seq = ++this.urlCheckSeq;
+    const url = this.plugin.settings.serverUrl;
+    const show = (tone: string, iconName: string, text: string): void => {
+      el.className = `oc-inline-status oc-tone-${tone}`;
+      el.empty();
+      icon(el, iconName, tone === 'busy' ? 'oc-spin' : '');
+      el.createSpan({ text });
+    };
+    if (!url) {
+      this.serverOk = false;
+      show('warn', 'info', t('settings.server.empty'));
+      this.renderCard();
       return;
     }
-    for (const entry of entries) {
-      const row = el.createDiv();
-      row.style.color = LEVEL_COLOR[entry.level];
-      const time = new Date(entry.time).toLocaleTimeString();
-      row.setText(`${time}  ${entry.message}`);
+    show('busy', 'loader-2|loader', t('settings.server.checking'));
+    const res = await checkServerHealth(url);
+    if (seq !== this.urlCheckSeq || !el.isConnected) return;
+    this.serverOk = res.ok;
+    if (res.ok) show('ok', 'check', t('settings.server.ok'));
+    else show('error', 'circle-alert|alert-circle', res.message);
+    this.renderCard();
+  }
+
+  private teardown(): void {
+    for (const c of this.cleanups.splice(0)) c();
+    if (this.urlCheckTimer !== null) {
+      window.clearTimeout(this.urlCheckTimer);
+      this.urlCheckTimer = null;
     }
   }
 
   hide(): void {
     this.isOpen = false;
-    this.unsubLog?.();
-    this.unsubLog = null;
-    this.logEl = null;
-    this.urlStatusEl = null;
-    if (this.urlCheckTimer !== null) {
-      window.clearTimeout(this.urlCheckTimer);
-      this.urlCheckTimer = null;
-    }
+    this.teardown();
+    this.cardEl = null;
+    this.urlCheckSeq++;
   }
 
   /** Re-render if the settings tab is currently open (e.g. after sign-in). */
